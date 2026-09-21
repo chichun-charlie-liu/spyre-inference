@@ -24,24 +24,25 @@ import torch
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor import spyre_hint
 
-# upstream/main's joint core-division + placement co-optimizer
-# (CoOptimizingAllocator, on by default) runs an exhaustive DFS over the
-# core-division cross-product regardless of LAYOUT_SOLVER, and that search
-# does not return in practical time for this kernel's graph (confirmed via
-# py-spy: 40+ stacked recurse frames, no progress after 30+ minutes). It
-# also does not help even when it does converge (see EXPERIMENTS_SUMMARY.md
-# section 3's co-optimizer columns). Equivalent to CO_OPTIMIZING_LX_PLANNING=0.
+# The joint core-division/placement co-optimizer doesn't return in practical
+# time for this kernel's graph, and doesn't help this kernel even when it
+# does converge. Equivalent to CO_OPTIMIZING_LX_PLANNING=0.
 _spyre_config.co_optimizing_lx_planning = False
 
-# T/8, Hnum/4 (32 cores total) is the best matmul division found for this
-# kernel's shape (num_heads=32, num_kv_heads=8, head_size=128, padded_query_len
-# up to 512): 930.7us -> 792.9us over the framework's own unhinted default,
-# via spyre_hint(work_div=...) alone -- see torch-spyre's
-# EXPERIMENTS_SUMMARY.md (gather-to-lx paged-attention Q/K/V investigation)
-# for the full sweep and ground truth. Assumes num_kv_heads is divisible by
-# 4; a model with a different num_kv_heads may need a different split (not
-# yet swept).
-_MATMUL_SPLIT = {"T": 8, "Hnum": 4}
+
+def _matmul_split(num_kv_heads: int) -> dict[str, int]:
+    """Best-known attention-matmul work division for this kernel's shapes.
+
+    ~1.7x faster than the framework's unhinted default, via
+    ``spyre_hint(work_div=...)`` alone -- see torch-spyre's
+    EXPERIMENTS_SUMMARY.md (gather-to-lx paged-attention investigation) for
+    the full sweep. Splitting ``Hnum`` requires it to divide evenly; models
+    with a ``num_kv_heads`` not divisible by 4 fall back to splitting only
+    the query-token axis (not yet swept for a better split of their own).
+    """
+    if num_kv_heads % 4 == 0:
+        return {"T": 8, "Hnum": 4}
+    return {"T": 8}
 
 
 def page_attn_head_major_prefill_kernel(
@@ -68,34 +69,19 @@ def page_attn_head_major_prefill_kernel(
     """
     num_queries_per_kv = num_heads // num_kv_heads
 
-    # Split the flat head axis into [num_kv_heads, num_queries_per_kv] BEFORE the
-    # gather, not after: the gather's own output then already carries the two
-    # head sub-axes as real dims, so torch-spyre can commit an Hnum x Hgrp
-    # matmul division directly onto it without a clone.
-    query_split = query.reshape(query.shape[0], num_kv_heads, num_queries_per_kv, head_size)
     # Gathered, not sliced: a compiled region reads a view from offset 0 and ignores its
     # strides (torch-spyre#3770).
-    #
-    # Name q_rows (the gather's own output, still [T, Hnum, Hgrp, D] -- real,
-    # separate dims) here, not q (post-permute): spyre_hint's named_dims=
-    # only attaches to FX nodes actually created within its scope, and a
-    # bare permute is a pure view Inductor elides/folds into the matmul's
-    # own read index rather than materializing its own buffer -- a hint
-    # wrapping only the permute never survives to reach any buffer's
-    # metadata. Naming the gather's real output here, and hinting its
-    # division directly (only "T" is a legal split axis for a gather; a
-    # gather can only split the axis it indexes over), lets it reach LX at
-    # full core utilization instead of falling back to whatever division
-    # `_distribute_work` would otherwise pick unprompted. Letting
-    # propagation carry the names through the subsequent permute (the same
-    # way it already handles k_page.transpose(-2,-1) with no hint of its
-    # own) is what makes the matmul's own work_div hint below resolve.
-    with spyre_hint(named_dims=["T", "Hnum", "Hgrp", "D"], work_div=_MATMUL_SPLIT):
-        q_rows = query_split.index_select(0, query_row_index[:padded_query_len])
-    q = q_rows.permute(1, 2, 0, 3)
+    q_rows = query.index_select(0, query_row_index[:padded_query_len])
+    q = (
+        q_rows.unsqueeze(0)
+        .transpose(1, 2)
+        .reshape(num_kv_heads, num_queries_per_kv, padded_query_len, head_size)
+    )
+
+    matmul_split = _matmul_split(num_kv_heads)
 
     def _hinted_matmul(a, b):
-        with spyre_hint(work_div=_MATMUL_SPLIT):
+        with spyre_hint(work_div=matmul_split):
             return torch.matmul(a, b)
 
     tile_max = None
