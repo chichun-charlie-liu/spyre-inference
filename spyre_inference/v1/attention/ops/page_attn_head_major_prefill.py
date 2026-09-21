@@ -22,6 +22,18 @@ amortised over every query row, so this kernel spends it instead: batched GQA ov
 
 import torch
 
+from torch_spyre._inductor import spyre_hint
+
+# T/8, Hnum/4 (32 cores total) is the best matmul division found for this
+# kernel's shape (num_heads=32, num_kv_heads=8, head_size=128, padded_query_len
+# up to 512): 930.7us -> 792.9us over the framework's own unhinted default,
+# via spyre_hint(work_div=...) alone -- see torch-spyre's
+# EXPERIMENTS_SUMMARY.md (gather-to-lx paged-attention Q/K/V investigation)
+# for the full sweep and ground truth. Assumes num_kv_heads is divisible by
+# 4; a model with a different num_kv_heads may need a different split (not
+# yet swept).
+_MATMUL_SPLIT = {"T": 8, "Hnum": 4}
+
 
 def page_attn_head_major_prefill_kernel(
     query,
@@ -47,14 +59,35 @@ def page_attn_head_major_prefill_kernel(
     """
     num_queries_per_kv = num_heads // num_kv_heads
 
+    # Split the flat head axis into [num_kv_heads, num_queries_per_kv] BEFORE the
+    # gather, not after: the gather's own output then already carries the two
+    # head sub-axes as real dims, so torch-spyre can commit an Hnum x Hgrp
+    # matmul division directly onto it without a clone.
+    query_split = query.reshape(query.shape[0], num_kv_heads, num_queries_per_kv, head_size)
     # Gathered, not sliced: a compiled region reads a view from offset 0 and ignores its
     # strides (torch-spyre#3770).
-    q_rows = query.index_select(0, query_row_index[:padded_query_len])
-    q = (
-        q_rows.unsqueeze(0)
-        .transpose(1, 2)
-        .reshape(num_kv_heads, num_queries_per_kv, padded_query_len, head_size)
-    )
+    #
+    # Name q_rows (the gather's own output, still [T, Hnum, Hgrp, D] -- real,
+    # separate dims) here, not q (post-permute): spyre_hint's named_dims=
+    # only attaches to FX nodes actually created within its scope, and a
+    # bare permute is a pure view Inductor elides/folds into the matmul's
+    # own read index rather than materializing its own buffer -- a hint
+    # wrapping only the permute never survives to reach any buffer's
+    # metadata. Naming the gather's real output here, and hinting its
+    # division directly (only "T" is a legal split axis for a gather; a
+    # gather can only split the axis it indexes over), lets it reach LX at
+    # full core utilization instead of falling back to whatever division
+    # `_distribute_work` would otherwise pick unprompted. Letting
+    # propagation carry the names through the subsequent permute (the same
+    # way it already handles k_page.transpose(-2,-1) with no hint of its
+    # own) is what makes the matmul's own work_div hint below resolve.
+    with spyre_hint(named_dims=["T", "Hnum", "Hgrp", "D"], work_div=_MATMUL_SPLIT):
+        q_rows = query_split.index_select(0, query_row_index[:padded_query_len])
+    q = q_rows.permute(1, 2, 0, 3)
+
+    def _hinted_matmul(a, b):
+        with spyre_hint(work_div=_MATMUL_SPLIT):
+            return torch.matmul(a, b)
 
     tile_max = None
     tile_sum = None
@@ -64,11 +97,13 @@ def page_attn_head_major_prefill_kernel(
         # One row of the unfolded cache: the folded per-kv-head gather exists to split for LX
         # residency. index_select, not subscripting, which lowers to aten.index and fails eager.
         page_idx = page_index_tables[i]
-        k_page = k_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
-        v_page = v_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
+        with spyre_hint(named_dims=["Hnum", "Hgrp", "St", "D"]):
+            k_page = k_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
+        with spyre_hint(named_dims=["Hnum", "Hgrp", "St", "D"]):
+            v_page = v_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
         mask_tile = mask_tiles[i]
 
-        scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
+        scores = _hinted_matmul(q, k_page.transpose(-2, -1)) * scale
         if logits_soft_cap > 0.0:
             # Before the mask add: tanh(-inf/cap)*cap is -cap, not -inf, so capping after it
             # would un-mask the padded lanes.
@@ -79,7 +114,7 @@ def page_attn_head_major_prefill_kernel(
         if i == 0:
             tile_max = scores_max
             tile_probs = torch.exp(scores - tile_max)
-            tile_output = torch.matmul(tile_probs, v_page)
+            tile_output = _hinted_matmul(tile_probs, v_page)
             tile_sum = tile_probs.sum(dim=-1, keepdim=True)
         else:
             assert tile_max is not None
@@ -90,7 +125,7 @@ def page_attn_head_major_prefill_kernel(
             tile_output = tile_output * rescale
             tile_sum = tile_sum * rescale
             tile_probs = torch.exp(scores - new_max)
-            tile_output = tile_output + torch.matmul(tile_probs, v_page)
+            tile_output = tile_output + _hinted_matmul(tile_probs, v_page)
             tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
             tile_max = new_max
 
