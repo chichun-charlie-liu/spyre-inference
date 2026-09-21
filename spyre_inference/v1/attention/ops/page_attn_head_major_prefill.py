@@ -21,7 +21,6 @@ amortised over every query row, so this kernel spends it instead: batched GQA ov
 """
 
 import torch
-
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor import spyre_hint
 
