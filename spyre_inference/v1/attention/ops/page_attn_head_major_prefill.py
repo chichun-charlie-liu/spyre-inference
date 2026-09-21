@@ -22,7 +22,17 @@ amortised over every query row, so this kernel spends it instead: batched GQA ov
 
 import torch
 
+from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor import spyre_hint
+
+# upstream/main's joint core-division + placement co-optimizer
+# (CoOptimizingAllocator, on by default) runs an exhaustive DFS over the
+# core-division cross-product regardless of LAYOUT_SOLVER, and that search
+# does not return in practical time for this kernel's graph (confirmed via
+# py-spy: 40+ stacked recurse frames, no progress after 30+ minutes). It
+# also does not help even when it does converge (see EXPERIMENTS_SUMMARY.md
+# section 3's co-optimizer columns). Equivalent to CO_OPTIMIZING_LX_PLANNING=0.
+_spyre_config.co_optimizing_lx_planning = False
 
 # T/8, Hnum/4 (32 cores total) is the best matmul division found for this
 # kernel's shape (num_heads=32, num_kv_heads=8, head_size=128, padded_query_len
