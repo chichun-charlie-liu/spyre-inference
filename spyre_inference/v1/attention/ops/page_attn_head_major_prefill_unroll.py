@@ -42,21 +42,6 @@ _spyre_config.co_optimizing_lx_planning = False
 _spyre_config.layout_solver = "greedy"
 
 
-def _matmul_split(num_kv_heads: int) -> dict[str, int]:
-    """Best-known attention-matmul work division for this kernel's shapes.
-
-    ~1.7x faster than the framework's unhinted default, via
-    ``spyre_hint(work_div=...)`` alone -- see torch-spyre's
-    EXPERIMENTS_SUMMARY.md (gather-to-lx paged-attention investigation) for
-    the full sweep. Splitting ``Hkv`` requires it to divide evenly; models
-    with a ``num_kv_heads`` not divisible by 4 fall back to splitting only
-    the query-token axis (not yet swept for a better split of their own).
-    """
-    if num_kv_heads % 4 == 0:
-        return {"T": 8, "Hkv": 4}
-    return {"T": 8}
-
-
 def page_attn_head_major_prefill_unroll_kernel(
     query,
     query_row_index,
@@ -83,7 +68,7 @@ def page_attn_head_major_prefill_unroll_kernel(
         mask_stack: [num_blocks, padded_query_len, block_size].
     """
     num_queries_per_kv = num_heads // num_kv_heads
-    matmul_split = _matmul_split(num_kv_heads)
+    matmul_split = {"T": 8, "Hkv": 4} if num_kv_heads % 4 == 0 else {"T": 8}
 
     # Gathered, not sliced outside: since torch-spyre#4449 a view's storage_offset is a
     # Dynamo graph guard, and q_start varies, so a slice would compile one kernel per batch
