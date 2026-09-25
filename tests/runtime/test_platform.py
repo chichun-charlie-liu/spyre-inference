@@ -290,7 +290,14 @@ def test_apply_config_leaves_a_fitting_pooling_max_num_seqs_alone():
     assert vllm_config.scheduler_config.max_num_seqs == 4
 
 
-def _fake_pad_config(head_dim=64, num_heads=8, *, transformers_backend=False, **rope_attrs):
+def _fake_pad_config(
+    head_dim=64,
+    num_heads=8,
+    *,
+    transformers_backend=False,
+    runner_type="generate",
+    **rope_attrs,
+):
     """Minimal vllm_config exposing everything _maybe_pad_head_dim touches.
 
     hf_config and hf_text_config share one object (the common case). Returns
@@ -307,6 +314,7 @@ def _fake_pad_config(head_dim=64, num_heads=8, *, transformers_backend=False, **
         hf_text_config=hf_config,
         model_arch_config=SimpleNamespace(head_size=head_dim),
         using_transformers_backend=lambda: transformers_backend,
+        runner_type=runner_type,
     )
     return SimpleNamespace(model_config=model_config), hf_config, model_config
 
@@ -406,6 +414,41 @@ def test_pad_head_dim_aligned_model_with_rope_dim_not_rejected():
     TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)  # returns early, no raise
 
     assert hf.head_dim == 128
+    assert not hasattr(hf, "_spyre_orig_head_dim")
+
+
+def test_pad_head_dim_pools_a_sub_stick_non_rope_model():
+    """granite-embedding-30m-english shape: no RoPE, pooling, head_dim 32 -> 64
+    (not 128 -- the RoPE path's width doesn't apply here)."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf, mc = _fake_pad_config(head_dim=32, num_heads=12, runner_type="pooling")
+    TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)
+
+    assert hf.head_dim == 64
+    assert hf._spyre_orig_head_dim == 32
+    assert mc.model_arch_config.head_size == 64
+
+
+def test_pad_head_dim_skips_a_non_rope_non_pooling_model():
+    """OPT/GPT-2 shape: no RoPE, not pooling -> untouched, as before."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf, _ = _fake_pad_config(head_dim=32, num_heads=12, runner_type="generate")
+    TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)
+
+    assert hf.head_dim == 32
+    assert not hasattr(hf, "_spyre_orig_head_dim")
+
+
+def test_pad_head_dim_skips_an_already_aligned_pooling_model():
+    """head_dim already a 64-multiple (e.g. granite-embedding-125m) -> no-op."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf, _ = _fake_pad_config(head_dim=64, num_heads=12, runner_type="pooling")
+    TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)
+
+    assert hf.head_dim == 64
     assert not hasattr(hf, "_spyre_orig_head_dim")
 
 
@@ -714,3 +757,56 @@ def test_configure_threading_raises_when_undetectable(monkeypatch):
 
     with pytest.raises(RuntimeError, match="SPYRE_NUM_CPUS"):
         configure_threading(worker_count=1)
+
+
+# ---------------------------------------------------------------------------
+# Registry check — end-to-end through check_and_update_config + platform boot
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("model", "tp_size", "max_model_len", "expect_warn"),
+    [
+        # Exact registry hit (gemma-3-1b-it, tp=1, len=32768) — no warning.
+        ("google/gemma-3-1b-it", 1, 32768, False),
+        # Same model, wrong max_model_len — not a registered config, warns.
+        ("google/gemma-3-1b-it", 1, 4096, True),
+        # Same model, wrong tp_size — not a registered config, warns.
+        ("google/gemma-3-1b-it", 2, 32768, True),
+    ],
+)
+def test_registry_check_via_platform(model, tp_size, max_model_len, expect_warn, caplog):
+    """Full platform boot: check_and_update_config fires _warn_if_not_in_registry.
+    Uses a real VllmConfig (gemma-3-1b-it, cached on CI) so the plugin activates
+    and the log line is emitted for miss cases, and is absent for hit cases."""
+    import logging
+
+    from vllm.config import ParallelConfig
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(
+            model=model,
+            max_model_len=max_model_len,
+            dtype="auto",
+            trust_remote_code=True,
+            enforce_eager=True,
+        ),
+        cache_config=CacheConfig(block_size=128),
+        compilation_config=CompilationConfig(custom_ops=["all"]),
+        parallel_config=ParallelConfig(tensor_parallel_size=tp_size),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="spyre_inference.platform"):
+        caplog.clear()
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+    registry_warnings = [
+        r for r in caplog.records if "not in the Spyre model registry" in r.message
+    ]
+    if expect_warn:
+        assert len(registry_warnings) >= 1
+        assert model in registry_warnings[0].message
+    else:
+        assert len(registry_warnings) == 0

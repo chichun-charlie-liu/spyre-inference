@@ -70,6 +70,7 @@ from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from spyre_inference import envs
+from spyre_inference.custom_ops.bert_head_pad import install_bert_head_pad
 from spyre_inference.custom_ops.head_pad import (
     fix_padded_attention_scale,
     fix_padded_rope,
@@ -107,6 +108,7 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
     encoder_len_ladder,
     encoder_rectangles,
     encoder_shape_tables,
+    expand_packed_embeds_to_encoder_grid,
     expand_packed_to_encoder_grid,
     expand_packed_token_types,
     logits_row_buckets,
@@ -496,6 +498,9 @@ class _SpyreModelWrapper:
         multimodal prompt starts producing garbage rather than failing, suspect
         that layout again before anything else here.
         """
+        # Generic path: model.embed_input_ids only does text embedding, or
+        # boolean-mask ops are handled inside the model's own patch (e.g.
+        # patch_embed_input_ids for Granite4Vision).
         num_tokens = input_ids.shape[0]
         bucketer = self._shape_bucketer
         padded_tokens = bucketer.find_bucket(num_tokens) if bucketer is not None else None
@@ -630,7 +635,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # as they stream in, when the platform overrode head_dim (e.g. head_size=64).
         # Must run before load_model builds+loads the (now 128-wide) params.
         install_padded_head_dim(self.model_config)
-        install_head_pad_weight_loader(model_loader, self.model_config.hf_config)
+        install_bert_head_pad(self.model_config)
+        install_head_pad_weight_loader(
+            model_loader, self.model_config.hf_text_config, self.model_config
+        )
         install_mlp_pad_weight_loader(model_loader, self.model_config.hf_text_config)
 
         # Load model on CPU
@@ -651,10 +659,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Restore original RoPE frequencies and attention scale corrupted by the
         # head_dim width override (no-op unless the platform padded head_dim).
-        verify_padded_head_dim(self.model, self.model_config.hf_config)
+        verify_padded_head_dim(self.model, self.model_config.hf_text_config)
         verify_padded_intermediate_size(self.model, self.model_config.hf_text_config)
-        fix_padded_rope(self.model, self.model_config.hf_config)
-        fix_padded_attention_scale(self.model, self.model_config.hf_config)
+        fix_padded_rope(self.model, self.model_config.hf_text_config)
+        fix_padded_attention_scale(self.model, self.model_config.hf_text_config)
 
         # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
         # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
@@ -675,7 +683,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
         logger.info("Model loaded for Spyre in %.3fs.", time.time() - t0)
 
-        # Patches instances, so it runs after load and before compile wraps modules
+        # Patches instances/classes, so it runs after load and before compile wraps modules
         # in OptimizedModule and breaks traversal.
         apply_multimodal_patches(self.model, self._spyre_device)
 
@@ -873,6 +881,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 if self.spyre_shape_bucketer is not None:
                     for size in sorted(self.spyre_shape_bucketer.bucket_sizes, reverse=True):
                         hidden_states, _ = self._dummy_run(size, force_attention=True)
+                        self._warmup_input_embedding(size)
                         self._dummy_pooler_run(hidden_states)
                         self._warm_pooler_row_widths(hidden_states)
                         self._warm_encoder_unpack(hidden_states)
@@ -900,6 +909,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             )
             with _set_spyre_compilation_settings(self.vllm_config):
                 self._dummy_run(num_tokens)
+                self._warmup_input_embedding(num_tokens)
             if is_pooling and self.spyre_shape_bucketer is not None:
                 self.spyre_shape_bucketer.mark_warmed_up()
             logger.info("Warmup done in %.3fs.", time.time() - t0)
@@ -921,6 +931,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             widest_hidden_states = None
             for size in sorted(bucket_sizes, reverse=True):
                 _, last_hidden_states = self._dummy_run(size)
+                self._warmup_input_embedding(size)
                 if widest_hidden_states is None:
                     widest_hidden_states = last_hidden_states
             # Row buckets, not one run per body bucket: the prefill bucket's token count
@@ -935,6 +946,27 @@ class TorchSpyreModelRunner(GPUModelRunner):
             len(bucket_sizes),
         )
         self._record_attention_graphs()
+
+    @torch.inference_mode()
+    def _warmup_input_embedding(self, num_tokens: int) -> None:
+        """Compile the embedding step a dummy run skips.
+
+        ``_dummy_run`` hands the model a zeroed ``inputs_embeds`` slice instead of
+        producing it the way ``_preprocess`` does, and producing it is what compiles.
+        """
+        # Only a decoder-only multimodal model embeds through ``embed_input_ids``: a
+        # text-only signature takes no multimodal arguments, so the call would raise.
+        mm_config = getattr(self.model_config, "multimodal_config", None)
+        if (
+            not self.supports_mm_inputs
+            or self.model_config.is_encoder_decoder
+            or (mm_config is not None and mm_config.mm_encoder_only)
+        ):
+            return
+        model = cast(_SpyreModelWrapper, self.model)
+        # int32 to match upstream's `input_ids` buffer; 0 is an id every vocab holds.
+        model.embed_input_ids(torch.zeros(num_tokens, dtype=torch.int32))
+        logger.info_once("Warming the input embedding through embed_input_ids.")
 
     @torch.inference_mode()
     def _record_attention_graphs(self) -> None:
@@ -1409,24 +1441,41 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if grid is None:
             return out
         input_ids, inputs_embeds, positions, *rest = out
-        if input_ids is None:
-            # Multimodal pooling would need the same rearrangement on the embeds.
-            raise NotImplementedError(
-                "Dense encoder expansion supports token inputs only; this model "
-                "supplied inputs_embeds."
-            )
-
         extent, width, query_lens = grid
         num_tokens = sum(query_lens)
-        ids, pos = expand_packed_to_encoder_grid(
-            input_ids[:num_tokens].cpu(),
-            positions[:num_tokens].cpu(),
-            query_lens,
-            width,
-            extent,
-            pad_token_id=self._encoder_pad_token_id(),
-        )
-        assert ids.shape[0] == width * extent, (ids.shape[0], width * extent)
+
+        if input_ids is not None:
+            ids, pos = expand_packed_to_encoder_grid(
+                input_ids[:num_tokens].cpu(),
+                positions[:num_tokens].cpu(),
+                query_lens,
+                width,
+                extent,
+                pad_token_id=self._encoder_pad_token_id(),
+            )
+            assert ids.shape[0] == width * extent, (ids.shape[0], width * extent)
+            grid_ids = convert(ids, input_ids.device)
+            grid_embeds = inputs_embeds
+        else:
+            # A multimodal pooling model (e.g. CLIP) preprocesses straight to
+            # embeddings; expand those instead of ids. Positions still need the
+            # same padding, so reuse that helper with dummy ids (discarded).
+            assert inputs_embeds is not None, "upstream must supply ids or embeds"
+            _, pos = expand_packed_to_encoder_grid(
+                torch.zeros(num_tokens, dtype=torch.int64),
+                positions[:num_tokens].cpu(),
+                query_lens,
+                width,
+                extent,
+            )
+            grid_ids = None
+            grid_embeds = convert(
+                expand_packed_embeds_to_encoder_grid(
+                    inputs_embeds[:num_tokens].cpu(), query_lens, width, extent
+                ),
+                inputs_embeds.device,
+            )
+            assert grid_embeds.shape[0] == width * extent, (grid_embeds.shape[0], width * extent)
 
         # token_type_ids rides through `rest` in model_kwargs and is one value per packed
         # token, so it needs the same rearrangement or every sequence past the first gets
@@ -1452,8 +1501,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
             regrouped.append(model_kwargs)
 
         return (
-            convert(ids, input_ids.device),
-            inputs_embeds,
+            grid_ids,
+            grid_embeds,
             convert(pos, positions.device),
             *regrouped,
         )

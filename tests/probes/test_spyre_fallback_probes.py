@@ -685,9 +685,9 @@ def test_spyre_compile_input_honors_row_offset_off_stick(spyre_device):
     """A row view whose width is not a whole number of sticks.
 
     test_spyre_compile_input_honors_storage_offset slices rows that are a whole number of
-    sticks wide, so its offsets are stick multiples. ``_rows_start_on_sticks`` in the MoE
-    gates the per-token row clones on exactly that property, so the off-stick width is the
-    case that decides whether the gate can go.
+    sticks wide, so its offsets are stick multiples. ``_rows_are_stick_addressable`` in the MoE
+    gates the per-token row clones on the same property, so an off-stick row stride is the case
+    that decides whether the gate can go.
     """
     rows, width = 2, 40
     assert (rows * width) % _FP16_ELEMS_PER_STICK != 0, "row stride must not be a stick multiple"
@@ -1333,3 +1333,75 @@ def test_spyre_compiled_pixtral_vision_attention_coarse_tile(spyre_device, tp_gr
     out = layer(x.to(spyre_device), mask, freqs_cis.to(spyre_device))
 
     torch.testing.assert_close(out.cpu().float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+# ---------------------------------------------------------------------------
+# 15. BLIP-2 Q-Former attention: upstream switch to F.scaled_dot_product_attention
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Blip2QFormerMultiHeadAttention.forward still uses an explicit "
+        "torch.matmul / torch.softmax chain whose permute/matmul/softmax layout "
+        "Spyre's restickify and bmm_padding passes cannot reconcile, forcing the "
+        "entire module to run on CPU (spyre_inference/multimodal/blip2.py). "
+        "vllm-project/vllm@a1541f5 replaces that chain with a single "
+        "F.scaled_dot_product_attention call. When this probe XPASS-es, "
+        "drop blip2.py and its call site in apply()."
+    ),
+)
+def test_vllm_blip2_qformer_uses_sdpa():
+    """Blip2QFormerMultiHeadAttention.forward must use scaled_dot_product_attention.
+
+    Source inspection: the current forward contains an explicit matmul/softmax
+    chain that Spyre cannot restickify.  vllm-project/vllm@a1541f5 replaces it
+    with F.scaled_dot_product_attention; when that version is in use this probe
+    flips to XPASS.
+    """
+    blip2 = pytest.importorskip("vllm.model_executor.models.blip2")
+
+    src = inspect.getsource(blip2.Blip2QFormerMultiHeadAttention.forward)
+    assert re.search(r"\bscaled_dot_product_attention\b", src), (
+        "Blip2QFormerMultiHeadAttention.forward still uses the matmul/softmax "
+        "chain; spyre_inference/multimodal/blip2.py CPU-fallback patch still needed"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 16. Eager GemmaRMSNorm
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "torch-spyre#2971: eager GemmaRMSNorm cannot multiply its staggered-EA "
+        "FP32 activation by a STANDARD [hidden] FP32 weight. When this XPASS-es, "
+        "remove force=True from SpyreGemmaRMSNorm."
+    ),
+)
+def test_spyre_eager_gemma_rms_norm(spyre_device):
+    """Upstream FP32 GemmaRMSNorm should run without a surrounding compiled graph."""
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+
+    torch.manual_seed(0)
+    x = torch.randn(4, 256, dtype=torch.float16)
+    weight = torch.randn(256, dtype=torch.float16)
+    norm = GemmaRMSNorm(256, eps=1e-6).to(torch.float16)
+    norm.weight.data.copy_(weight)
+
+    x_device = x.to(spyre_device)
+    norm.to(spyre_device)
+
+    # Bypass the Spyre OOT wrapper: this probe asks whether torch-spyre can lower
+    # the unchanged upstream implementation eagerly, not whether the workaround works.
+    actual = GemmaRMSNorm.forward_native(norm, x_device).cpu().float()
+
+    x_fp32 = x.float()
+    variance = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+    expected = (
+        x_fp32 * torch.rsqrt(variance + norm.variance_epsilon) * (weight.float() + 1.0)
+    ).half()
+    torch.testing.assert_close(actual, expected.float(), atol=1e-2, rtol=2e-3)
