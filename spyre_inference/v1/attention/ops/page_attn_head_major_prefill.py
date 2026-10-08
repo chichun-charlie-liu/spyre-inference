@@ -64,7 +64,11 @@ def page_attn_head_major_prefill_kernel(
         .transpose(1, 2)
         .reshape(num_kv_heads, num_queries_per_kv, padded_query_len, head_size)
     )
-    with spyre_hint(work_div={"x": 8, "mb": 4}):
+    # named_dims is required: work_div can only split a dimension that's already
+    # named somewhere in the op's own input chain. Without it, "x"/"mb" below would
+    # only land on Hkv/Hq_kv by positional coincidence, and nothing downstream (e.g.
+    # a matmul hinted with a named `T` split) could inherit a real T-split from Q.
+    with spyre_hint(named_dims=["Hkv", "Hq_kv", "T", "D"], work_div={"T": 8, "Hkv": 4}):
         q = q_view * 1.0
 
     # Both walks tile tensor axes, so what an unrolled walk read per block arrives
