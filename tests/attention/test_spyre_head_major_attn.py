@@ -485,9 +485,9 @@ def test_head_major_store_fuses_to_one_kernel(default_vllm_config, num_kv_heads,
 
 
 _SHAPES = [
-    pytest.param([(1, 128)], id="decode_single"),
+    pytest.param([(1, 128)], id="decode_single", marks=pytest.mark.attention_smoke),
     pytest.param([(1, 300), (1, 64), (1, 512)], id="decode_batch"),
-    pytest.param([(64, 64)], id="prefill_single"),
+    pytest.param([(64, 64)], id="prefill_single", marks=pytest.mark.attention_smoke),
     pytest.param([(128, 128), (64, 200)], id="prefill_batch"),
     pytest.param([(64, 300), (1, 128)], id="mixed_batch"),
 ]
@@ -531,6 +531,11 @@ def test_head_major_dispatches_by_query_width(
     """A decode takes the LX-resident kernel and a wider query the batched one. Sending a
     wide query to the decode kernel pays for residency the query width already amortises."""
     from spyre_inference.v1.attention.backends import spyre_head_major_attn as hm
+
+    # Batched decode now covers every batch size, and it serves a mixed batch's decode
+    # prefix before the per-seq loop runs, so the per-seq kernels are the subject here.
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
+    envs.clear_env_cache()
 
     called = []
 
@@ -927,8 +932,9 @@ def test_head_major_decode_body_matches_fp32_reference(
     Card-free and fp32, as its token-major twin: it pins the read and the entry-major,
     kv-minor row order the mask is broadcast in, not the fp16 tolerances.
     """
+    from test_spyre_attn import _decode_reference_fp32
+
     from spyre_inference.v1.attention.ops import batched_decode_head_major, tile_loop
-    from tests.attention.test_spyre_attn import _decode_reference_fp32
 
     monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
     monkeypatch.setattr(batched_decode_head_major, "USE_FOR_EACH_TILE", False)
@@ -1042,7 +1048,7 @@ def test_head_major_batched_decode_uses_plain_page_ids(default_vllm_config, conf
     Guards against folding them onto ``page * KV + kv`` again: that moves the same bytes
     with num_kv_heads times the gather entries, which measured ~2x the kernel time.
     """
-    from tests.attention.test_spyre_attn import _build_metadata
+    from spyre_testing_plugin.attn_helpers import _build_metadata
 
     torch.set_default_device("cpu")
     num_query_heads, num_kv_heads, head_size, block_size = 8, 4, 64, 64
@@ -1070,7 +1076,7 @@ def test_head_major_batched_decode_uses_plain_page_ids(default_vllm_config, conf
     )
 
     assert impl._batched_decode_supported()
-    assert impl._batched_decode_preconditions_met(attn_metadata), (
+    assert impl._batched_decode_preconditions_met(attn_metadata, 1 + num_seqs * blocks_per_seq), (
         "an all-decode batch of 8 must reach the batched path, or the test proves nothing"
     )
     assert attn_metadata.chunk_page_ids_cpu is not None
@@ -1082,6 +1088,48 @@ def test_head_major_batched_decode_uses_plain_page_ids(default_vllm_config, conf
         attn_metadata.padded_num_seqs,
     )
     assert table.dtype == torch.int32
+
+
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+def test_dispatch_declines_a_gather_spanning_the_cache(default_vllm_config, configure_compilation):
+    """Dispatch keeps the recorder's page bound, so it never reaches a variant warmup skipped.
+
+    Two decode seqs of two blocks each over a three-page cache is the TP2 gemma-4 shape
+    that compiled the skipped variant mid-serving and hit a torch-spyre codegen assert.
+    """
+    from spyre_testing_plugin.attn_helpers import _build_metadata
+
+    torch.set_default_device("cpu")
+    num_query_heads, num_kv_heads, head_size, block_size = 8, 2, 64, 64
+    num_seqs, blocks_per_seq = 2, 2
+
+    attn_metadata = _build_metadata(
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=torch.full((num_seqs,), blocks_per_seq * block_size, dtype=torch.int32),
+        query_start_loc=torch.arange(num_seqs + 1, dtype=torch.int32),
+        block_table=torch.ones(num_seqs, blocks_per_seq, dtype=torch.int32),
+        slot_mapping=torch.zeros(num_seqs, dtype=torch.int64),
+    )
+    impl = SpyreHeadMajorAttentionImpl(
+        num_heads=num_query_heads,
+        head_size=head_size,
+        scale=head_size**-0.5,
+        num_kv_heads=num_kv_heads,
+    )
+    assert attn_metadata.padded_num_seqs is not None
+    assert attn_metadata.blocks_per_chunk is not None
+    entries = attn_metadata.padded_num_seqs * attn_metadata.blocks_per_chunk
+
+    assert impl._batched_decode_preconditions_met(attn_metadata, entries + 1)
+    assert not impl._batched_decode_preconditions_met(attn_metadata, entries)
+    assert not impl._batched_decode_preconditions_met(attn_metadata, entries - 1)
 
 
 @pytest.fixture()

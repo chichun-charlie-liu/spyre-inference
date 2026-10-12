@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, 'release-*']
     types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
     inputs:
@@ -27,7 +27,7 @@ on:
         type: string
       skip_uv_for_benchmarking:
         description: >
-          Bypass `uv run` and use the prebaked venv's python3 directly. Needed
+          Bypass `uv run` and use the active venv's python3 directly. Needed
           on s390x, where uv cannot resolve a torch/vllm wheel and otherwise
           builds a torch-less venv. Leave false on amd64/ppc64le.
         required: false
@@ -118,6 +118,17 @@ jobs:
       DEVICE_NAME: spyre
       DEVICE_TYPE: IBM_Spyre
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      # The trace files the serve configs replay are cached on the 1Ti RWX PVC
+      # that is mounted into every runner pod at /storage-1, alongside the uv and
+      # HuggingFace caches this repo already keeps there. It survives the pod, so
+      # the first job to need a trace fetches it and every later job on any runner
+      # reads it straight off the PVC. Per-file locks reduce duplicate fetches;
+      # cross-pod deduplication depends on NFS locking.
+      STORAGE_1_DIR: /storage-1/spyre-inference
+      SPYRE_BENCH_DATA_DIR: /storage-1/spyre-inference/.cache/artifacts
+      ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
+      ARTIFACTORY_DATA_PATH: ${{ secrets.ARTIFACTORY_DATA_PATH }}
+      ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
 
     steps:
       - name: Checkout repository
@@ -128,18 +139,19 @@ jobs:
         if: ${{ !inputs.use_prebaked_image }}
         uses: ./.github/actions/spyre-rpm-install
 
+      # Binary only; the cache is shipped from /storage-1 by the uv-nfs-cache
+      # steps below. See .github/scripts/nfs_uv_cache.py.
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
         with:
-          enable-cache: true
-          # Invalidate only on lock changes; setup-uv's default glob also hashes
-          # pyproject.toml, so config-only edits would needlessly bust the cache.
-          cache-dependency-glob: |
-            uv.lock
-            spyre-rpms.lock
-          cache-local-path: ${{ runner.temp }}/setup-uv-cache
-          # See prune-uv-cache-safe
-          prune-cache: false
+          enable-cache: false
+
+      # Restore now; the post step ships the cache back at job end (writers only).
+      - name: uv cache (NFS)
+        if: ${{ !inputs.use_prebaked_image }}
+        uses: ./.github/actions/uv-nfs-cache
+        with:
+          storage-root: ${{ env.STORAGE_1_DIR }}/.cache/uv
 
       - name: Install spyre-inference
         run: |
@@ -149,20 +161,15 @@ jobs:
           echo "=== Installed versions ==="
           uv pip show torch torch-spyre vllm spyre-inference 2>/dev/null || true
 
-      # Ephemeral runners inherit a stale $VIRTUAL_ENV at /home/senuser/.venv that
-      # the sync above ignored; repoint and remove it so `uv run --active` in
-      # perf-tests finds the workspace venv. Mirrors run-matrix-config.
+      # ibm-aiu-setup.sh re-activates the image's baked /home/senuser/.venv
+      # ($VIRTUAL_ENV) in every perf-tests recipe shell, so the run targets the
+      # project .venv the Makefile repoints to (see AIU_SETUP_CMD), not this value.
+      # This repoint still steers non-recipe uv steps that don't source the profile.
       - name: Activate the freshly-built venv
         if: ${{ !inputs.use_prebaked_image }}
         run: |
-          rm -rf /home/senuser/.venv
           echo "VIRTUAL_ENV=${GITHUB_WORKSPACE}/.venv" >> "$GITHUB_ENV"
           echo "${GITHUB_WORKSPACE}/.venv/bin" >> "$GITHUB_PATH"
-
-      # Slim the cache for setup-uv's post-job save without discarding the
-      # compiled torch-spyre/vllm wheels. Must run after the uv sync above.
-      - name: Prune uv cache (safe)
-        uses: ./.github/actions/prune-uv-cache-safe
 
       - name: Resolve vLLM commit
         env:

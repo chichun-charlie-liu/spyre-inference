@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     # module attributes. Keep in sync with ``environment_variables``.
     SPYRE_DEVICES: str | None = None
     SPYRE_COMPILE_GRANULARITY: str = "block"
-    SPYRE_COMPILE_GUARD: str = "off"
+    SPYRE_COMPILE_GUARD: str = "warn"
     SPYRE_ATTN_PROFILING: bool = False
     SPYRE_ATTN_RECORD: bool = True
     SPYRE_ATTN_FOR_EACH_TILE: bool = True
@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     SPYRE_BATCHED_DECODE: bool = True
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
-    SPYRE_MOE_GATHERED_MAX_TOKENS: int = 4
+    SPYRE_MOE_GATHERED_MAX_TOKENS: int = 8
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
 
@@ -59,15 +59,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SPYRE_COMPILE_GRANULARITY": lambda: os.getenv("SPYRE_COMPILE_GRANULARITY") or "block",
     # What to do when a model block, attention kernel or the lm_head compiles *after*
     # warmup, which costs a full Inductor compile mid-request:
-    #  - "off": nothing (default)
-    #  - "warn": log each distinct violation
+    #  - "off": nothing
+    #  - "warn": log each distinct violation (default)
     #  - "error": raise. Use in CI to keep a warmup-coverage regression from landing,
     #    bearing in mind it catches most but not all: torch runs its compile-start
     #    callbacks only when a process-wide pending counter goes 0 -> 1, so a compile
     #    starting while another is in flight goes unreported.
     # torch-spyre compiles every eager aten op, so those compiles continue for the
     # whole run; they are never reported.
-    "SPYRE_COMPILE_GUARD": lambda: os.getenv("SPYRE_COMPILE_GUARD") or "off",
+    "SPYRE_COMPILE_GUARD": lambda: os.getenv("SPYRE_COMPILE_GUARD") or "warn",
     # When "1", wrap attention forward/softmax in torch.profiler.record_function
     # spans for kineto trace capture. Off by default: profiled runs are not
     # wall-clock comparable.
@@ -87,7 +87,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # [1] + multiples of min(512, max_num_batched_tokens) up to max_num_batched_tokens.
     "SPYRE_ATTN_QUERY_BUCKETS": lambda: os.getenv("SPYRE_ATTN_QUERY_BUCKETS"),
     # Comma-separated num_seqs buckets for the batched decode kernel, unset uses the
-    # default buckets of powers of two from 4 up to max_num_seqs.
+    # default buckets of powers of two from 1 up to max_num_seqs.
     "SPYRE_ATTN_NUM_SEQS_BUCKETS": lambda: os.getenv("SPYRE_ATTN_NUM_SEQS_BUCKETS"),
     # Which KV cache layout the decoder attention backend uses, within a page:
     #  - "head_major":  [num_blocks, num_kv_heads, block_size, head_size] (default), which
@@ -100,9 +100,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Core cap for the attention compile only, leaving the rest of the model on all 32.
     # "0" (default) lets the LX path pick its own cap and leaves the others uncapped.
     "SPYRE_ATTN_MAX_CORES": lambda: int(os.getenv("SPYRE_ATTN_MAX_CORES", "0")),
-    # When "1" (default), enables the batched multi-sequence decode kernel for
-    # batches of at least _MIN_BATCHED_SEQS sequences; smaller batches take the
-    # per-seq loop either way. Under the default tiled walk it applies only to the
+    # When "1" (default), enables the batched multi-sequence decode kernel.
+    # Under the default tiled walk it applies only to the
     # head-major cache, which uses a split page index, so a token-major run keeps
     # the per-seq loop whatever this is set to.
     "SPYRE_BATCHED_DECODE": lambda: bool(int(os.getenv("SPYRE_BATCHED_DECODE", "1"))),
@@ -117,7 +116,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SPYRE_MAX_NUM_PARTIAL_PREFILLS": lambda: int(os.getenv("SPYRE_MAX_NUM_PARTIAL_PREFILLS", "1")),
     # Largest packed-token count handled by a compiled loop of single-token gathered kernels.
     # Larger batches use one all-expert kernel because its fixed weight-read cost is amortized.
-    "SPYRE_MOE_GATHERED_MAX_TOKENS": lambda: int(os.getenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "4")),
+    # "8" (default) is measured on gemma-4-26B-A4B: gathered wins up to 8 at TP1 and TP4.
+    "SPYRE_MOE_GATHERED_MAX_TOKENS": lambda: int(os.getenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "8")),
     # CPU budget used to size thread pools. "0" (default) auto-detects the budget
     # (cgroup CPU quota, then physical core count).
     "SPYRE_NUM_CPUS": lambda: int(os.getenv("SPYRE_NUM_CPUS", "0")),

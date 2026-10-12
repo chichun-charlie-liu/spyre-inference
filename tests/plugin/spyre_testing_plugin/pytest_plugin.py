@@ -51,7 +51,6 @@ Environment Variables
 ---------------------
 SKIP_UPSTREAM_TESTS     Set to 1/true/yes to skip upstream test cloning, even when
                         the -m expression or --upstream asks for them
-UPSTREAM_TESTS_PATHS    Comma-separated paths (default: auto from YAML)
 VLLM_COMMIT             Override vLLM commit (default: from pyproject.toml)
 VLLM_REPO_URL           Override vLLM repo URL
 XDG_CACHE_HOME          Base cache directory (default: ~/.cache)
@@ -694,9 +693,8 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
             item.add_marker(upstream_marker)
 
-            # Tag upstream items here (the conftest fixture binds only under
-            # tests/). Before the skip/xfail branches so a tag lands regardless
-            # of the item's eventual disposition.
+            # Tag upstream items before the skip/xfail branches so tags land
+            # regardless of the item's eventual disposition.
             params = getattr(getattr(item, "callspec", None), "params", {})
             for name, value in result_tags(params):
                 item.user_properties.append((name, value))

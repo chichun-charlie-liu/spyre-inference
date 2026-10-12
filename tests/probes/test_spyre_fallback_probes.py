@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Strict-xfail probes for torch-spyre primitives blocking CPU fallbacks.
+"""Probes for torch-spyre primitives blocking CPU fallbacks.
 
 Each test exercises a single primitive that spyre-inference needs on-device
-(decoder forward, encoder pack, pooling). They are intentionally strict
-xfail: when a primitive starts working in torch-spyre, the corresponding
-probe flips to XPASS and we can remove the associated workaround here.
+(decoder forward, encoder pack, pooling). Strict xfails flag newly working
+primitives so their workarounds can be removed. The one-row matmul timing probe
+is non-strict: an XPASS calls for remeasurement before removing its workaround.
 
 Section 10 applies the same idea to workarounds for upstream vLLM bugs: those
 probes need no device and inspect vLLM instead.
@@ -1200,13 +1200,14 @@ def test_vllm_gemma4_self_decoder_registers_aliased_scalars():
 # ---------------------------------------------------------------------------
 
 
+# Non-strict: a wall-clock ratio varies by CI host, so an XPASS reports rather than fails.
 @pytest.mark.xfail(
-    strict=True,
+    strict=False,
     reason=(
-        "A 1-row matmul against a fused gate/up weight runs far below the rate the "
-        "same weight sustains with a full 8-row block, so padding the activation out "
-        "to the 8 PT rows is faster despite the extra rows. When this passes, drop "
-        "custom_ops/linear.py::SpyrePaddedRowsLinearMethod and the `_PAD_ROWS` "
+        "A 1-row matmul against a fused gate/up weight is slower than the same weight "
+        "against a full 8-row block, so padding the activation out to the 8 PT rows "
+        "is faster despite the extra rows. When this XPASSes, re-measure decode and "
+        "drop custom_ops/linear.py::SpyrePaddedRowsLinearMethod and the `_PAD_ROWS` "
         "constants it reads. Tracked by torch-spyre#4032."
     ),
 )
@@ -1235,8 +1236,8 @@ def test_spyre_one_row_matmul_not_slower_than_full_row_block(spyre_device):
         best_of(rows, reps=3)
     one_row, full_block = best_of(1), best_of(8)
 
-    # Run-to-run spread is a few percent and the gap is far wider, so 10% is not noise.
-    assert one_row <= 1.10 * full_block, (
+    # Padding stops paying off exactly when 1 row is no slower than the 8 rows it pads to.
+    assert one_row <= full_block, (
         f"1 row {one_row * 1e3:.2f} ms vs 8 rows {full_block * 1e3:.2f} ms "
         f"({100 * (one_row / full_block - 1):.0f}% slower)"
     )
@@ -1336,41 +1337,7 @@ def test_spyre_compiled_pixtral_vision_attention_coarse_tile(spyre_device, tp_gr
 
 
 # ---------------------------------------------------------------------------
-# 15. BLIP-2 Q-Former attention: upstream switch to F.scaled_dot_product_attention
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Blip2QFormerMultiHeadAttention.forward still uses an explicit "
-        "torch.matmul / torch.softmax chain whose permute/matmul/softmax layout "
-        "Spyre's restickify and bmm_padding passes cannot reconcile, forcing the "
-        "entire module to run on CPU (spyre_inference/multimodal/blip2.py). "
-        "vllm-project/vllm@a1541f5 replaces that chain with a single "
-        "F.scaled_dot_product_attention call. When this probe XPASS-es, "
-        "drop blip2.py and its call site in apply()."
-    ),
-)
-def test_vllm_blip2_qformer_uses_sdpa():
-    """Blip2QFormerMultiHeadAttention.forward must use scaled_dot_product_attention.
-
-    Source inspection: the current forward contains an explicit matmul/softmax
-    chain that Spyre cannot restickify.  vllm-project/vllm@a1541f5 replaces it
-    with F.scaled_dot_product_attention; when that version is in use this probe
-    flips to XPASS.
-    """
-    blip2 = pytest.importorskip("vllm.model_executor.models.blip2")
-
-    src = inspect.getsource(blip2.Blip2QFormerMultiHeadAttention.forward)
-    assert re.search(r"\bscaled_dot_product_attention\b", src), (
-        "Blip2QFormerMultiHeadAttention.forward still uses the matmul/softmax "
-        "chain; spyre_inference/multimodal/blip2.py CPU-fallback patch still needed"
-    )
-
-
-# ---------------------------------------------------------------------------
-# 16. Eager GemmaRMSNorm
+# 15. Eager GemmaRMSNorm
 # ---------------------------------------------------------------------------
 
 

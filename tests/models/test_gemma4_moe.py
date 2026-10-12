@@ -459,6 +459,7 @@ def test_above_the_gathered_bound_the_all_expert_form_takes_the_batch(monkeypatc
 )
 def test_multi_token_dispatch_picks_the_recipe_routing(monkeypatch, routing, routing_fn, route_fn):
     """The persistent form runs routing -> route -> experts for the selected recipe."""
+    monkeypatch.setenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "4")
     calls, resets = _dispatch_recorder(monkeypatch)
     _apply(_dispatch_layer(routing), tokens=8)
     assert calls == [
@@ -471,10 +472,81 @@ def test_multi_token_dispatch_picks_the_recipe_routing(monkeypatch, routing, rou
 
 def test_named_dims_are_reset_when_a_region_raises(monkeypatch):
     """Unconditional reset: on an Inductor cache hit stale names leak into the next graph."""
+    monkeypatch.setenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "4")
     calls, resets = _dispatch_recorder(monkeypatch, fail_on="experts")
     with pytest.raises(RuntimeError, match="region blew up"):
         _apply(_dispatch_layer("topk_softmax"), tokens=8)
     assert resets == [1], "the reset must survive a failing region"
+
+
+@pytest.mark.parametrize(
+    ("routing", "expected"),
+    [
+        ("full_softmax", ["_probs", "_route", "_moe_persistent_in_graph"]),
+        ("topk_softmax", ["_topk_probs", "_route_selected", "_moe_persistent_in_graph"]),
+    ],
+)
+def test_traced_dispatch_inlines_the_persistent_form_without_compiled_regions(
+    monkeypatch, routing, expected
+):
+    """Inside the block graph the forms are traced directly, routing in the logits' dtype."""
+    from spyre_inference import moe as moe_module
+
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(moe_module, "_region", lambda *args: pytest.fail("entered a region"))
+    calls = []
+    for name in ("_gathered", "_gathered_tokens", "_probs", "_topk_probs", "_route"):
+        monkeypatch.setattr(
+            moe_module, name, lambda *args, _name=name: calls.append((_name, args[-1]))
+        )
+    monkeypatch.setattr(moe_module, "_experts", lambda *args: pytest.fail("ran the region form"))
+    for name in ("_route_selected", "_moe_persistent_in_graph"):
+        monkeypatch.setattr(moe_module, name, lambda *args, _name=name: calls.append((_name,)))
+
+    _apply(_dispatch_layer(routing), tokens=64)
+    assert [call[0] for call in calls] == expected
+    if expected[0] == "_probs":
+        assert calls[0][1] == torch.float32, "routing must stay in the logits' dtype in-graph"
+
+
+def test_moe_runner_traces_only_stick_aligned_batches():
+    """In-graph routing only lowers at whole sticks; other batches keep the opaque op."""
+    from vllm.model_executor.custom_op import op_registry_oot
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner
+
+    from spyre_inference.moe import SpyreMoERunner
+
+    assert op_registry_oot["MoERunner"] is SpyreMoERunner
+    runner = object.__new__(SpyreMoERunner)
+    runner.moe_config = SimpleNamespace(in_dtype=torch.float16)
+    runner._shared_experts = None
+    runner._select_forward()
+    assert runner._entry_for(512) is moe_runner._moe_forward
+    assert runner._entry_for(8) is torch.ops.vllm.moe_forward
+    runner._shared_experts = object()
+    assert runner._entry_for(64) is moe_runner._moe_forward_shared
+    assert runner._entry_for(3) is torch.ops.vllm.moe_forward_shared
+
+
+def test_post_load_builds_the_quant_config_before_the_first_traced_call(monkeypatch):
+    """Built lazily in a traced block, it becomes a guard warmup flips: a re-trace mid-serving."""
+    from types import MethodType
+
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+    from spyre_inference import moe as moe_module
+    from spyre_inference.moe import SpyreUnquantizedFusedMoEMethod
+
+    monkeypatch.setattr(moe_module, "_prepare_layer", lambda layer: None)
+    method = object.__new__(SpyreUnquantizedFusedMoEMethod)
+    method.moe = SimpleNamespace(has_bias=False)
+    method.moe_quant_config = None
+    layer = SimpleNamespace(spyre_moe_recipe=object(), quant_method=method)
+    init = RoutedExperts._ensure_moe_quant_config_init
+    layer._ensure_moe_quant_config_init = MethodType(init, layer)
+
+    method.process_weights_after_loading(layer)
+    assert method.moe_quant_config is not None
 
 
 def test_gathered_matches_dense_reference(moe_weights):
@@ -651,6 +723,67 @@ def test_persistent_matches_dense_reference(moe_weights, num_tokens):
     torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-2)
 
 
+def test_traced_persistent_dispatch_matches_dense_reference():
+    """Traced into one graph, as a compiled block does for a stick-aligned token bucket.
+
+    SpyreMoERunner only traces batches that span whole sticks of tokens; this is that path,
+    end to end through ``apply_monolithic``, at gemma-4's expert count and one stick of tokens.
+    """
+    from spyre_testing_plugin.pytest_plugin import spyre_available
+    from torch_spyre._C import get_elem_in_stick
+    from torch_spyre.model_utils import dma_moe_expert_weight_to_spyre
+    from torch_spyre.ops.fallbacks import FallbackWarning
+
+    from spyre_inference.moe import SpyreMoERecipe, SpyreUnquantizedFusedMoEMethod
+
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    top_k = 8
+    torch.manual_seed(0)
+    host = {
+        "gate": torch.randn(GEMMA4_EXPERTS, HIDDEN, INTER, dtype=torch.float16) * 0.05,
+        "up": torch.randn(GEMMA4_EXPERTS, HIDDEN, INTER, dtype=torch.float16) * 0.05,
+        "down": torch.randn(GEMMA4_EXPERTS, INTER, HIDDEN, dtype=torch.float16) * 0.05,
+    }
+    stick = get_elem_in_stick(torch.float16)
+    layer = SimpleNamespace(
+        spyre_moe_recipe=SpyreMoERecipe("gelu_tanh", "full_softmax"),
+        spyre_moe_gate=dma_moe_expert_weight_to_spyre(host["gate"]),
+        spyre_moe_up=dma_moe_expert_weight_to_spyre(host["up"]),
+        spyre_moe_down=dma_moe_expert_weight_to_spyre(host["down"]),
+        spyre_moe_stick=stick,
+        spyre_moe_route_identity=torch.eye(stick, dtype=torch.float16).to("spyre"),
+        top_k=top_k,
+    )
+    gen = torch.Generator().manual_seed(stick)
+    x = torch.randn(stick, HIDDEN, dtype=torch.float16, generator=gen) * 0.5
+    logits = torch.randn(stick, GEMMA4_EXPERTS, dtype=torch.float16, generator=gen)
+
+    def block(x, logits):
+        # In-graph producers, so the MoE inputs are compiler-laid-out as in a decoder block.
+        return SpyreUnquantizedFusedMoEMethod.apply_monolithic(None, layer, x * 1.0, logits * 1.0)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", FallbackWarning)
+        compiled = torch.compile(block, backend="inductor", fullgraph=True, dynamic=False)
+        actual = compiled(x.to("spyre"), logits.to("spyre"))
+
+    fallbacks = [str(w.message) for w in caught if issubclass(w.category, FallbackWarning)]
+    assert not fallbacks, f"the traced dispatch fell back to CPU: {fallbacks}"
+    expected = _dense_reference(
+        x,
+        torch.softmax(logits, dim=-1),
+        host["gate"],
+        host["up"],
+        host["down"],
+        torch.ones(GEMMA4_EXPERTS),
+        top_k,
+    )
+    assert actual.shape == x.shape
+    torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-2)
+
+
 # One core; a split that is the whole axis; a divisor below the core count; and a
 # core-count split at a longer axis.
 @pytest.mark.parametrize("tokens", [1, 24, 40, 64])
@@ -665,6 +798,25 @@ def test_token_cores_is_the_largest_split_that_divides_the_token_axis(tokens):
     assert tokens % cores == 0, f"{cores} does not divide {tokens}"
     assert 1 <= cores <= limit
     assert all(tokens % larger for larger in range(cores + 1, limit + 1)), "not the largest split"
+
+
+def test_persistent_expert_loop_matches_dense_on_host():
+    from spyre_inference.moe import _moe_persistent
+
+    torch.manual_seed(0)
+    tokens, experts, hidden, inter = 24, 6, 16, 24
+    x = torch.randn(tokens, hidden)
+    gate = torch.randn(experts, hidden, inter)
+    up = torch.randn(experts, hidden, inter)
+    down = torch.randn(experts, inter, hidden)
+    route = torch.rand(tokens, experts, 1)
+
+    per_expert = torch.matmul(x.unsqueeze(0), gate)
+    activated = F.gelu(per_expert, approximate="tanh") * torch.matmul(x.unsqueeze(0), up)
+    expected = (torch.matmul(activated, down) * route.permute(1, 0, 2)).sum(dim=0)
+
+    actual = _moe_persistent(x, route, gate, up, down, "gelu_tanh")
+    torch.testing.assert_close(actual, expected)
 
 
 class _RoutedExperts(torch.nn.Module):

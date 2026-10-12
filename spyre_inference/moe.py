@@ -30,6 +30,11 @@ import torch
 import torch.nn.functional as F
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
+    MoERunner,
+    _moe_forward,
+    _moe_forward_shared,
+)
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
@@ -286,14 +291,59 @@ def _moe_persistent(
     activation: str,
 ) -> torch.Tensor:
     from torch_spyre._inductor.propagate_hints import spyre_hint
+    from torch_spyre._inductor.wsr import for_each_tile
 
-    experts = gate.shape[0]
     with spyre_hint(named_dims=["E", "T", "ONE"]):
         route = route.permute(1, 0, 2).contiguous().clone()
-    with spyre_hint(num_tiles_per_dim={"E": experts}, work_div={"T": _token_cores(x.shape[0])}):
-        h = x.unsqueeze(0)
-        activated = _activation(torch.matmul(h, gate), torch.matmul(h, up), activation)
-        return (torch.matmul(activated, down) * route).sum(dim=0)
+
+    def expert_body(acc, tiles):
+        x, route_tile, gate_tile, up_tile, down_tile = tiles
+        activated = _activation(torch.matmul(x, gate_tile), torch.matmul(x, up_tile), activation)
+        return acc + (torch.matmul(activated, down_tile) * route_tile).squeeze(0), None
+
+    with spyre_hint(work_div={"T": _token_cores(x.shape[0])}):
+        result, _ = for_each_tile(
+            expert_body,
+            (x, route, gate, up, down),
+            dims=(None, 0, 0, 0, 0),
+            tile_size=1,
+            init=torch.zeros_like(x),
+        )
+    return result
+
+
+def _moe_persistent_in_graph(
+    x: torch.Tensor,
+    route: torch.Tensor,
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    down: torch.Tensor,
+    activation: str,
+) -> torch.Tensor:
+    """``_moe_persistent`` inside a block graph, where nothing names x's token axis."""
+    from torch_spyre._inductor.propagate_hints import spyre_hint
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    with spyre_hint(named_dims=["E", "T", "ONE"]):
+        route = route.permute(1, 0, 2).contiguous().clone()
+
+    def expert_body(acc, tiles):
+        x, route_tile, gate_tile, up_tile, down_tile = tiles
+        activated = _activation(torch.matmul(x, gate_tile), torch.matmul(x, up_tile), activation)
+        return acc + torch.matmul(activated, down_tile) * route_tile, None
+
+    # Loop-body ops only receive this scope's hints, so T is named here; every body op stays
+    # at [1, T, C] (C is M or H) so one name list fits them all.
+    init = torch.zeros_like(x).unsqueeze(0)
+    with spyre_hint(work_div={"T": _token_cores(x.shape[0])}, named_dims=["ONE", "T", "C"]):
+        result, _ = for_each_tile(
+            expert_body,
+            (x, route, gate, up, down),
+            dims=(None, 0, 0, 0, 0),
+            tile_size=1,
+            init=init,
+        )
+    return result.squeeze(0)
 
 
 def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
@@ -453,6 +503,31 @@ def _prepare_layer(layer: RoutedExperts) -> None:
     )
 
 
+@MoERunner.register_oot(name="MoERunner")
+class SpyreMoERunner(MoERunner):
+    """Takes vLLM's direct MoE entry, as upstream does on CPU and TPU, for stick-aligned batches.
+
+    A compiled block then compiles the MoE dispatch along with the rest of its graph. In-graph
+    routing only lowers when the token axis spans whole sticks, so other batch sizes keep the
+    opaque ``torch.ops.vllm.moe_forward`` op and its compiled regions.
+    """
+
+    def _select_forward(self) -> Callable:
+        from torch_spyre._C import get_elem_in_stick
+
+        self._spyre_stick = get_elem_in_stick(self.moe_config.in_dtype)
+        return self._spyre_forward_entry
+
+    def _spyre_forward_entry(self, hidden_states: torch.Tensor, *args: Any) -> Any:
+        return self._entry_for(hidden_states.shape[0])(hidden_states, *args)
+
+    def _entry_for(self, tokens: int) -> Callable:
+        shared = self.shared_experts is not None
+        if tokens % self._spyre_stick == 0:
+            return _moe_forward_shared if shared else _moe_forward
+        return torch.ops.vllm.moe_forward_shared if shared else torch.ops.vllm.moe_forward
+
+
 @CustomOp.register_oot(name="UnquantizedFusedMoEMethod")
 class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     """OOT bridge from vLLM's unquantized MoE method to ``SpyreMoERecipe``."""
@@ -471,6 +546,9 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 "this architecture has not opted in."
             )
         _prepare_layer(cast("RoutedExperts", layer))
+        # MoERunner._forward_impl initializes this lazily. Traced, that check becomes a guard
+        # which warmup's first call flips, so the first real request would re-trace the block.
+        layer._ensure_moe_quant_config_init()
 
     def apply_monolithic(
         self,
@@ -480,8 +558,28 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         layer = cast("RoutedExperts", layer)
-        moe_scope, persistent_scope = _compiler_scopes()
         tokens = x.shape[0]
+        if torch.compiler.is_compiling():
+            # Traced into the block graph, which SpyreMoERunner only does for stick-aligned
+            # batches: the persistent form runs inline, without compiled regions or their
+            # scopes. An in-graph fp32 softmax cannot be lowered, so routing stays in the
+            # logits' dtype.
+            # Note: This branching here is solely done to support eager and compiled
+            # execution of the experts.
+            recipe = layer.spyre_moe_recipe
+            if recipe.routing == "full_softmax":
+                route = _route(layer, _probs(router_logits, router_logits.dtype))
+            else:
+                route = _route_selected(layer, _topk_probs(router_logits, layer.top_k))
+            return _moe_persistent_in_graph(
+                x,
+                route,
+                layer.spyre_moe_gate,
+                layer.spyre_moe_up,
+                layer.spyre_moe_down,
+                recipe.activation,
+            )
+        moe_scope, persistent_scope = _compiler_scopes()
         # A single row is handed to the region whole, so no row slice needs an addressable offset.
         if tokens == 1 or (
             tokens <= envs.SPYRE_MOE_GATHERED_MAX_TOKENS
