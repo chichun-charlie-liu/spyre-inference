@@ -190,6 +190,11 @@ def _si(run: dict) -> tuple[dict, dict]:
     return env.get("spyre-inference") or {}, env.get("spyre-inference-main") or {}
 
 
+def _upstream(info: dict) -> str:
+    up = info.get("upstream_main") or {}
+    return f", = {up['ref']} at run time" if up.get("current") else ""
+
+
 def labels(run: dict) -> dict:
     hf = (run["envs"].get("hf") or _any_env(run)).get("hf-adapters-spyre") or {}
     si, main = _si(run)
@@ -372,11 +377,13 @@ def environment(run: dict, h: str) -> list[str]:
         )
     hf = (run["envs"].get("hf") or env).get("hf-adapters-spyre") or {}
     if hf:
-        out.append(f"- **hf-adapters:** `{hf.get('commit')}` (`{hf.get('version')}`)")
+        out.append(
+            f"- **hf-adapters:** `{hf.get('commit')}` (`{hf.get('version')}`{_upstream(hf)})"
+        )
     ts = env.get("torch-spyre") or {}
     out.append(
-        f"- **torch-spyre:** `{ts.get('commit')}` (installed `{ts.get('version')}`), "
-        "one build for all arms"
+        f"- **torch-spyre:** `{ts.get('commit')}` (installed `{ts.get('version')}`"
+        f"{_upstream(ts)}), one build for all arms"
     )
     versions = [
         f"**{d}** {(env.get(d) or {}).get('version', '?')}"
@@ -407,8 +414,7 @@ def findings(runs: list[dict], h: str) -> list[str]:
     out = [
         f"{h} Environment findings",
         "",
-        "WARN deviates from the issue's recipe and was accepted for this run; INFO is recorded "
-        "only.",
+        "WARN was reviewed and accepted for this run; INFO is recorded only.",
         "",
     ]
     for (level, message), f in sorted(seen.items(), key=lambda kv: order.index(kv[0][0])):

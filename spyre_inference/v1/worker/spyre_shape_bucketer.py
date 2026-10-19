@@ -387,23 +387,28 @@ def expand_packed_token_types(
     return torch.tensor(grid, dtype=token_type_ids.dtype)
 
 
-def expand_packed_embeds_to_encoder_grid(
-    inputs_embeds: torch.Tensor,
-    query_lens: Sequence[int],
-    batch_bucket: int,
-    len_bucket: int,
-) -> torch.Tensor:
-    """Scatter packed input embeddings into the ``[B*L, hidden]`` grid; every pad row is zero.
+def encoder_grid_source_rows(
+    query_lens: Sequence[int], batch_bucket: int, len_bucket: int
+) -> list[int]:
+    """Packed row each ``[B*L]`` grid row reads from; every pad row reads row 0.
 
-    ``expand_packed_to_encoder_grid``'s counterpart for a multimodal pooling model (e.g.
-    CLIP) whose preprocessing produces embeddings rather than ids. Pad rows are zero, same
-    as ``expand_packed_token_types``: always masked out of attention before being read.
+    The inverse of ``encoder_dense_row_indices``, as a gather index rather than a
+    scatter, so a multimodal pooling model (e.g. CLIP) whose preprocessing produces
+    embeddings can build its grid with one ``index_select`` on the device. Pad rows
+    carry a real token's embedding rather than zeros: they are masked out of attention
+    and never pooled, so only finiteness matters.
     """
-    grid = torch.zeros(
-        batch_bucket * len_bucket, inputs_embeds.shape[-1], dtype=inputs_embeds.dtype
-    )
-    grid[encoder_dense_row_indices(query_lens, len_bucket)] = inputs_embeds
-    return grid
+    if len(query_lens) > batch_bucket:
+        raise ValueError(f"num_seqs={len(query_lens)} exceeds batch_bucket={batch_bucket}")
+    rows = [0] * (batch_bucket * len_bucket)
+    src = 0
+    for seq_idx, length in enumerate(query_lens):
+        if length > len_bucket:
+            raise ValueError(f"a query length exceeds len_bucket={len_bucket}: {list(query_lens)}")
+        dst = seq_idx * len_bucket
+        rows[dst : dst + length] = range(src, src + length)
+        src += length
+    return rows
 
 
 def logits_row_buckets(bucket_sizes: Sequence[int], max_num_reqs: int) -> list[int]:
@@ -435,6 +440,32 @@ class SpyreShapeBucketer:
             self._bucket_sizes[0] if self._bucket_sizes else 0,
             self._max_bucket_size,
         )
+
+    @classmethod
+    def for_config(cls, vllm_config: VllmConfig) -> SpyreShapeBucketer | None:
+        """The runner's bucketer for 1D body token sizes, or None when it needs none.
+
+        Decoder and pooling share 1D ``compile_sizes``; pooling's is a single entry,
+        the token budget.
+
+        Pooling keeps a bucketer in eager *and* compile so *runtime* always
+        1D-pads the body. Warmup still differs: compile dummies each 1D size
+        (attention compiles through ``force_attention``); eager does one
+        dummy then ``mark_warmed_up()``. Decoder skips a bucketer when eager
+        because 1D pad exists only to hit compiled graphs.
+        """
+        if vllm_config.model_config.runner_type == "pooling":
+            return cls.for_pooling(vllm_config)
+
+        if vllm_config.model_config.enforce_eager:
+            logger.info("Graph Recorder disabled (enforce_eager=True)")
+            return None
+
+        if not vllm_config.compilation_config.compile_sizes:
+            logger.info("Graph Recorder disabled (no compile_sizes configured)")
+            return None
+
+        return cls(vllm_config)
 
     @classmethod
     def for_pooling(cls, vllm_config: VllmConfig) -> SpyreShapeBucketer | None:
@@ -477,6 +508,13 @@ class SpyreShapeBucketer:
         if idx < len(self._bucket_sizes):
             return self._bucket_sizes[idx]
         return None
+
+    def warmed_bucket(self, num_tokens: int) -> int | None:
+        """The padded token count, or None before warmup or past the last bucket."""
+        if not self._is_warmed_up:
+            return None
+        desc = self.dispatch(num_tokens)
+        return None if desc is None else desc.padded_num_tokens
 
     def dispatch(self, num_tokens: int) -> SpyreBucketDescriptor | None:
         """Compute padded batch descriptor for the given token count.

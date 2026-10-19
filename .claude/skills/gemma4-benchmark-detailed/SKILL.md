@@ -1,6 +1,6 @@
 ---
-name: gemma4-benchmark
-description: "Benchmark Gemma-4 26B-A4B on Spyre: hf-adapters (pinned PR #620, 9b075e4) against spyre-inference main and the spyre-inference branch under test, on the already installed environment. Two workloads on the same 1984-token prompt, each at whichever of TP1, TP2 and TP4 the user picks: the prefill TTFT of spyre-inference#1102 (the maintainer's ttft.py vs `vllm bench latency`) and decode ITL as the granite TP4 ITL report measured it ((lat64 - lat1) / 63). Every arm runs at the same TP (vLLM --tensor-parallel-size, hf-adapters under torchrun). Checks the environment read-only (pins, profiler-free build, consistent Spyre libraries, env knobs, a stale main, enough cards) and flags every inconsistency to the user instead of fixing it; never installs, syncs, rebuilds, fetches or checks anything out. Runs the arms one at a time and ends with a shareable Markdown report, TP scaling included. Use when asked to benchmark or reproduce Gemma-4 / gemma-4-26B-A4B TTFT, prefill or decode latency or ITL, at one or several tensor-parallel sizes, reproduce #1102, compare spyre-inference with hf-adapters, or measure a branch or an MoE change against main."
+name: gemma4-benchmark-detailed
+description: "Benchmark Gemma-4 26B-A4B on Spyre: hf-adapters, at whichever version the user installed, against spyre-inference main and the spyre-inference branch under test, on the already installed environment. Two workloads on the same 1984-token prompt, each at whichever of TP1, TP2 and TP4 the user picks: the prefill TTFT of spyre-inference#1102 (the maintainer's ttft.py vs `vllm bench latency`) and decode ITL as the granite TP4 ITL report measured it ((lat64 - lat1) / 63). Every arm runs at the same TP (vLLM --tensor-parallel-size, hf-adapters under torchrun). Checks the environment read-only (checkouts not at their latest upstream main, profiler-free build, consistent Spyre libraries, env knobs, enough cards) and flags every inconsistency to the user instead of fixing it; never installs, syncs, rebuilds, fetches or checks anything out. Runs the arms one at a time and ends with a shareable Markdown report and HTML page, TP scaling included. Use when asked to benchmark or reproduce Gemma-4 / gemma-4-26B-A4B TTFT, prefill or decode latency or ITL, at one or several tensor-parallel sizes, reproduce #1102, compare spyre-inference with hf-adapters, or measure a branch or an MoE change against main."
 ---
 
 # Gemma-4 benchmark: hf-adapters vs spyre-inference main vs the branch under test
@@ -14,10 +14,11 @@ Two workloads on the same 1984-token prompt, batch 1, each at TP1, TP2 or TP4:
 - **ITL** (`--itl`): decode latency the way the granite-3.3-8b TP4 ITL report (2026-10-02)
   measured it.
 
-Three arms, alternating: **hf** (hf-adapters), **main** (spyre-inference at `--main-ref`),
-**branch** (the spyre-inference checkout installed in the environment). At TP N every arm
-runs on N cards, so every comparison is at equal card count. Every run ends with a
-`report.md` meant to be shared as is.
+Three arms, alternating: **hf** (the hf-adapters installed in the environment, at the version
+the user chose), **main** (spyre-inference at `--main-ref`), **branch** (the spyre-inference
+checkout installed in the environment). At TP N every arm runs on N cards, so every
+comparison is at equal card count. Every run ends with a `report.md` and a `report.html`
+meant to be shared as is.
 
 ## The one rule: never alter the environment
 
@@ -55,6 +56,10 @@ On dt-inductor pods: `--env-script /scratch/virtualenv/<env>/bin/activate`, or
    only sets variables in the script's own shell. `--hf-python` runs the hf arm in a
    different interpreter (the issue used a separate env for it). The branch under test is
    whatever spyre-inference checkout that environment has installed.
+   - **Versions are the user's choice.** The hf arm runs whichever hf-adapters its
+     environment has installed, on that environment's torch-spyre. Unless the user already
+     said, ask which hf-adapters version they want to compare against. If it is not the
+     installed one, they install it themselves. The skill pins no version.
 2. **Pick the combination.** Unless the user already said, ask which workloads to run at
    which TP sizes: TTFT and ITL each at any subset of TP1, TP2, TP4. TP N needs N cards.
    Tell them the run count: with all three arms, each TTFT size is 3 runs per `--repeat`,
@@ -66,8 +71,9 @@ On dt-inductor pods: `--env-script /scratch/virtualenv/<env>/bin/activate`, or
    - **ERROR:** stop. Explain what is wrong and what the user would need to change, e.g.
      "torch-spyre links libaiupti: rebuild it with the profiler off", or "--tp 4 needs 4
      cards, this host has 2: drop TP4 from the list". Do not change it.
-   - **WARN:** list each one and ask whether to benchmark anyway. Only after a yes, re-run
-     with `--accept-warnings`. The accepted WARNs are printed in the report.
+   - **WARN:** list each one and ask whether to benchmark anyway. A checkout behind its
+     upstream main is expected when the user picked that version on purpose. Only after a
+     yes, re-run with `--accept-warnings`. The accepted WARNs are printed in the report.
    - **INFO:** mention them in the report; no question needed.
 5. **Run** (after step 4) in the background, polling its output. Nothing else may use the
    cards meanwhile. The suite re-checks every combination first and starts none if one
@@ -83,8 +89,12 @@ On dt-inductor pods: `--env-script /scratch/virtualenv/<env>/bin/activate`, or
    - TP scaling compares sizes that ran one after another: fine for scaling, not for small
      differences.
 
-   Hand the user the report's path; it already holds the headline, TP scaling, method,
-   commands, raw results, environment and accepted findings.
+   Both reports already hold the headline, TP scaling, method, commands, raw results,
+   environment and accepted findings. Then write `<suite>/narrative.json` with what needs
+   judgement: the recommendation, what the gates above turned up, and anything the user should
+   not miss (keys in [HTML report](#html-report)). Re-render the page with
+   `python -I -B $SKILL/scripts/html_report.py <suite> > <suite>/report.html` and hand the
+   user both paths. When the session can publish artifacts, publish `report.html` too.
 
 ## Workloads
 
@@ -116,7 +126,7 @@ batches (spyre-inference `SpyreMoERunner`) runs decode through the opaque op, li
   in the issue. spyre-inference supports TP ≥ 1 in fp16 with a native `all_reduce`.
 - **hf-adapters**: `hf_latency.py` under `python -m torch.distributed.run --nproc-per-node N`,
   loading with `tp_plan="auto"` like hf-adapters' `scripts/run_multicard_smoke.py`. Gemma-4
-  TP is hf-adapters #522, which the pinned `9b075e4` contains. Rank 0 writes the results.
+  TP needs hf-adapters #522 or later. Rank 0 writes the results.
 - **Cards:** `$SPYRE_DEVICES` if set, else the numbered IOMMU-group nodes under `/dev/vfio`.
   TP above that is an ERROR at the check, and nothing runs. hf ranks get the first N pinned
   devices, else `SPYRE_DEVICES=0,…,N-1`.
@@ -126,12 +136,12 @@ batches (spyre-inference `SpyreMoERunner`) runs decode through the opaque op, li
 - **Scaling:** the suite report puts each arm's summary at every TP next to the same arm's
   TP1, with speedup and parallel efficiency. Include 1 in a list to get it.
 
-## What the issue pins, and how the skill uses each pin
+## The issue's recipe, and how the skill uses it
 
 | issue recipe | in this skill |
 |---|---|
-| hf-adapters PR #620 at `9b075e46bc9689671fb7ba546ef12b3e509bbdc5` | checked; anything else is a WARN |
-| hf-adapters' torch-spyre `e9d31328345f55ead94d1a65736380e6e07513bc` `[cpsat]` | checked; anything else is a WARN (it says whether the env's build contains `e9d3`) |
+| hf-adapters PR #620 (`9b075e4`) | not pinned: the installed hf-adapters, at the version the user chose |
+| hf-adapters' torch-spyre `e9d3` `[cpsat]` | not pinned: the environment's torch-spyre |
 | `ttft.py` from the comment | [`scripts/ttft.py`](scripts/ttft.py): the comment's code (sha1 `58c92665e1258821878142ea8dcec1d803ec6b29`) plus this repository's license header and formatting; same syntax tree |
 | `OMP_NUM_THREADS=8 uv run --no-sync python ttft.py --model <model> --input-len 1984` | the same command, with the env's interpreter in place of `uv run --no-sync python` |
 | `uv run --no-sync vllm bench latency --model <model> --input-len 1984 --output-len 1 --batch-size 1 --num-iters-warmup 2 --num-iters 3 --max-model-len 2048 --max-num-seqs 1` | the same command via the env's `vllm` entry point, plus `--output-json`; the branch arm runs it from the checkout, main from its export |
@@ -144,8 +154,14 @@ how the maintainer provisioned their host. They are **not** executed here.
 
 `scripts/check_env.py` imports only torch and torch_spyre. It locates every other package
 without importing it, and reads checkouts with `git rev-parse` / `status` / `log` /
-`merge-base --is-ancestor`, plus one `git ls-remote` of GitHub's main. It writes no bytecode
-(`python -B`), and neither do the benchmark runs.
+`merge-base --is-ancestor`, plus one `git ls-remote` of each repository's GitHub main. It
+writes no bytecode (`python -B`), and neither do the benchmark runs.
+
+No version is pinned. A repository that is not at the latest commit of its upstream main is
+a WARN: torch-spyre, hf-adapters and the main arm's `--main-ref`, each against GitHub's
+`torch-spyre/<repo>` main. When GitHub is unreachable, the comparison falls back to the
+checkout's own remote for that repository (`upstream/main`, `remote/main`, ...) as last
+fetched. Otherwise the installed versions are taken to be the ones the user wants.
 
 | finding | level |
 |---|---|
@@ -154,13 +170,13 @@ without importing it, and reads checkouts with `git rev-parse` / `status` / `log
 | hf-adapters or vllm / spyre-inference not installed; model `config.json` unreadable | ERROR |
 | main arm: no checkout, no remote pointing at `torch-spyre/spyre-inference`, or `--main-ref` does not resolve | ERROR |
 | `--tp` above the host's cards (`$SPYRE_DEVICES`, else `/dev/vfio`) | ERROR |
-| hf-adapters not at `9b075e4`; torch-spyre not `e9d3` | WARN |
-| `--main-ref` differs from GitHub's main (stale); the branch lacks commits of main | WARN |
+| torch-spyre, hf-adapters or `--main-ref` not at the latest commit of its upstream main | WARN |
+| the branch lacks commits of main | WARN |
 | `_C.so` built from another commit than the torch-spyre checkout's HEAD | WARN |
-| modified tracked files in a checkout; unmet `transformers==5.15.0` / `torch~=2.13.0` / vllm requirement | WARN |
+| modified tracked files in a checkout; a requirement of hf-adapters, torch-spyre or spyre-inference the env does not meet | WARN |
 | Spyre libraries resolving from more than one install tree (e.g. in-tree `sentient/` plus `/opt/ibm/spyre`) | WARN |
 | behaviour-changing env vars (`SPYRE_*`, `VLLM_*`, `TORCHINDUCTOR_*`, `TORCH_LOGS`, `SENCORES`, `FRONTEND_POOL_ALLOCATION`, `CO_OPTIMIZING*`, `DXP_*`) | WARN |
-| cache dirs, `OMP_NUM_THREADS`, `VLLM_PLUGINS`, `SPYRE_DEVICES`; stale editable metadata; spyre-inference's own torch-spyre pin vs the env's; GitHub unreachable | INFO |
+| cache dirs, `OMP_NUM_THREADS`, `VLLM_PLUGINS`, `SPYRE_DEVICES`; stale editable metadata; spyre-inference's own torch-spyre pin vs the env's; GitHub unreachable; a package with no recorded commit | INFO |
 | model `model_type` not Gemma-4 | WARN |
 
 The run itself refuses a busy card (`fuser /dev/vfio/vfio`). The `OMP_WAIT_POLICY` /
@@ -169,9 +185,9 @@ only, so they are not environment findings.
 
 ## Deviations from the issue
 
-1. **One environment for all arms** by default, so the hf arm runs the env's torch-spyre
-   rather than a dedicated `e9d3` build. The check flags this as a WARN, with the
-   commit relation. Pass `--hf-python` to use a separate env the user built.
+1. **The installed versions, in one environment for all arms** by default. The hf arm runs
+   the env's hf-adapters and torch-spyre rather than the issue's #620 on a dedicated `e9d3`
+   build. Pass `--hf-python` to use a separate env the user built.
 2. **The env's interpreter instead of `uv run --no-sync`.** Same execution, no uv involved.
 3. **`ttft.py` runs from the skill directory**, not from inside the hf-adapters clone, so
    nothing is written into the checkout. With an installed `hf_adapters` the imports are
@@ -215,7 +231,7 @@ only, so they are not environment findings.
 ## Reference results
 
 From the dt-inductor2 pod, 2026-10-06/07, all arms on one profiler-free torch-spyre
-(`2ab31d08`, which contains `e9d3`), TTFT at TP1. A ballpark, not a contract:
+(`2ab31d08`), TTFT at TP1. A ballpark, not a contract:
 
 | arm | commit | median TTFT vs hf |
 |---|---|---|
@@ -228,19 +244,41 @@ ITL and TP2+ depend on the host and its cards: take them from your own runs.
 ## Output layout
 
 `run_suite.sh` writes `<suite>/report.md` (all combinations in one shareable page, TP
-scaling included) and `report.json`, plus one `run_1102.sh` directory per combination
+scaling included), the same as `report.html` (see [HTML report](#html-report)) and
+`report.json`, plus one `run_1102.sh` directory per combination
 (`ttft_tp1/`, `ttft_tp2/`, `itl_tp4/`, ...). The suite dir defaults to
 `${GEMMA4_BENCH_OUT:-~/gemma4-benchmark}/suite_<timestamp>`. Each combination holds:
 
-- `report.md` / `report.json`: headline, method with the exact commands, raw
-  avg/p10/p50/p90/p99 per run, environment (commits, versions, cards, RPMs), findings.
+- `report.md` / `report.html` / `report.json`: headline, method with the exact commands,
+  raw avg/p10/p50/p90/p99 per run, environment (commits, versions, cards, RPMs), findings.
 - `<arm>_out<len>_<rep>/`: `run.log`, `meta.json`, and `latency.json` (vLLM's JSON, or
   `hf_latency.py`'s; `ttft.py`'s median is read from `run.log`).
 - `env_<arm>.json`: everything the check found, with its findings.
 - `workload.json`, `plan.txt` (the commands), `provenance.txt` (host, date, interpreters,
   CPU, cards, `ibm-*` RPMs), `args.txt` (the flags used).
 
+## HTML report
+
+`html_report.py` renders the same data as `report.md` into one self-contained page: a verdict
+row, bar panels per TP size, tables with every replicate, TP scaling, run-integrity checks,
+method, environment and every run. Each spyre-inference arm gets a pill against the arm above
+it: main, or a lone branch, against hf-adapters as a ratio, and the branch against main as a
+change. The pill is outlined when the two replicate ranges overlap. Each arm has one colour,
+validated for colour-blind separation in both themes: hf-adapters violet, main orange,
+branch blue. An ITL workload with a LEAK run is charted from p50s, the gate's rule, with the
+averages alongside.
+
+Without a narrative the page derives its title, references and one verdict tile per workload
+and TP size: the branch against main, or else against hf-adapters. `<dir>/narrative.json`, or
+`--narrative FILE`, adds the judgement. All keys are optional, and their values are HTML:
+`title`, `eyebrow`, `h1`, `lede`, `refs`, `verdict` (`[{"big": ..., "lab": ...}]`),
+`recommendation`, `itl_sub`, `ttft_sub`, `itl_notes`, `ttft_notes`, `scaling_notes`,
+`findings` (`[{"sev": "major" | "minor" | "nit", "title": ..., "loc": ..., "dl": [[term, html],
+...]}]`), `checks`, `method`, `not_covered`, `footer`. `checks` and `method` add to the
+generated lists; every other key replaces its default. The page loads its fonts from Google
+Fonts; everything else, data included, is inline.
+
 ## Installing this skill on another host
 
 Copy or symlink this directory into a project's `.claude/skills/`, or into
-`~/.claude/skills/`. Keep the directory name `gemma4-benchmark`.
+`~/.claude/skills/`. Keep the directory name `gemma4-benchmark-detailed`.

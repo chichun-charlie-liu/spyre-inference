@@ -12,18 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Check an environment against the spyre-inference#1102 recipe. Changes nothing.
+"""Check the environment of a Gemma-4 benchmark. Changes nothing.
 
 Imports only torch and torch_spyre (to prove the runtime libraries load); every other
 package is located with find_spec and read through its metadata. Checkouts are only read:
 `git rev-parse` / `status` / `log` / `rev-list` / `remote` / `merge-base --is-ancestor`.
 
-Each finding is ERROR (cannot be benchmarked), WARN (deviates from the issue's recipe; the
-user must accept it) or INFO (recorded only).
+Each finding is ERROR (cannot be benchmarked), WARN (the user must accept it) or INFO
+(recorded only). No version is pinned: torch-spyre, hf-adapters and the main arm's
+spyre-inference are compared with the latest commit of their GitHub main (`git ls-remote`,
+a read), and anything else is a WARN.
 
 The main arm runs spyre-inference at --main-ref (default: <the torch-spyre/spyre-inference
-remote>/main), exported from the checkout with `git archive`; this script resolves that ref
-and compares it with GitHub's main via `git ls-remote` (a read).
+remote>/main), exported from the checkout with `git archive`.
 
 Usage: python -I check_env.py --out env.json --arms hf,main,branch --model PATH
            [--main-ref REF] [--allow-profiler]
@@ -39,10 +40,12 @@ import re
 import subprocess
 import sys
 
-# The issue's pins: hf-adapters #620 and the torch-spyre its hf-adapters env was built with.
-HF_SHA = "9b075e46bc9689671fb7ba546ef12b3e509bbdc5"
-UPSTREAM = "torch-spyre/spyre-inference"
-TS_SHA = "e9d31328345f55ead94d1a65736380e6e07513bc"
+# The GitHub repository whose main each package is expected to be at.
+UPSTREAM = {
+    "torch-spyre": "torch-spyre/torch-spyre",
+    "hf-adapters-spyre": "torch-spyre/hf-adapters",
+    "spyre-inference": "torch-spyre/spyre-inference",
+}
 PACKAGES = {
     "torch-spyre": "torch_spyre",
     "transformers": "transformers",
@@ -114,6 +117,58 @@ def _package(dist: str, module: str) -> dict:
     return info
 
 
+def _upstream_remote(checkout: str, repo: str) -> str | None:
+    remotes = (_run("git", "-C", checkout, "remote", "-v") or "").splitlines()
+    names = sorted({r.split()[0] for r in remotes if re.search(rf"[/:]{repo}(\.git)?\s", r)})
+    return names[0] if names else None
+
+
+def _github_main(repo: str) -> str | None:
+    head = _run(
+        "timeout", "20", "git", "ls-remote", f"https://github.com/{repo}.git", "refs/heads/main"
+    )
+    return head.split()[0] if head else None
+
+
+def _check_latest(env: dict, dist: str, name: str, arm: str) -> None:
+    """WARN unless the package is at the latest commit of its upstream main."""
+    info, repo = env.get(dist) or {}, UPSTREAM[dist]
+    commit, checkout = info.get("commit") or info.get("built_from"), info.get("checkout")
+    if not commit:
+        flag("INFO", arm, f"{name} {info.get('version')} records no commit to compare with")
+        return
+    latest, source = _github_main(repo), f"{repo} main"
+    if not latest and checkout and (remote := _upstream_remote(checkout, repo)):
+        latest = _run("git", "-C", checkout, "rev-parse", "--verify", "--quiet", f"{remote}/main")
+        source = f"{remote}/main"
+        flag("INFO", arm, f"could not reach GitHub: {name} is compared with {source} as fetched")
+    if not latest:
+        flag("INFO", arm, f"could not reach GitHub to check that {name} is at {repo} main")
+        return
+    current = latest.startswith(commit)
+    info["upstream_main"] = {"ref": source, "commit": latest, "current": current}
+    if current:
+        return
+    rel = ""
+    if checkout:
+        git = ("git", "-C", checkout, "rev-list", "--count")
+        behind, ahead = _run(*git, f"{commit}..{latest}"), _run(*git, f"{latest}..{commit}")
+        if behind is None or ahead is None:
+            rel = "; not fetched into the checkout"
+        elif ahead == "0":
+            rel = f"; {behind} commit(s) behind"
+        elif behind == "0":
+            rel = f"; it contains main, plus {ahead} commit(s)"
+        else:
+            rel = f"; {behind} commit(s) behind, {ahead} not on main"
+    flag(
+        "WARN",
+        arm,
+        f"{name} is at {commit[:12]}, not at the latest {source} ({latest[:12]}{rel}): "
+        "accept it if that is the version to benchmark",
+    )
+
+
 def _requirement_met(requirement: str, dist: str, installed: str) -> bool | None:
     try:
         from packaging.requirements import Requirement
@@ -137,7 +192,7 @@ def _requirements(env: dict, owner: str, dist: str, arm: str) -> None:
             flag("WARN", arm, f"{owner} requires `{r}`, the env has {dist} {installed}")
 
 
-def _check_torch_spyre(env: dict, arms: list[str], allow_profiler: bool) -> None:
+def _check_torch_spyre(env: dict, allow_profiler: bool) -> None:
     ts = env["torch-spyre"]
     so = ts["c_so"]
     # libc10/libtorch live in torch/lib, which `import torch` loads; ldd needs it on the path.
@@ -181,21 +236,7 @@ def _check_torch_spyre(env: dict, arms: list[str], allow_profiler: bool) -> None
             "both",
             f"torch-spyre checkout {checkout} has {ts['dirty']} modified tracked file(s)",
         )
-    if "hf" in arms and commit != TS_SHA:
-        if (
-            checkout
-            and _run("git", "-C", checkout, "merge-base", "--is-ancestor", TS_SHA, "HEAD")
-            is not None
-        ):
-            ahead = _run("git", "-C", checkout, "rev-list", "--count", f"{TS_SHA}..HEAD")
-            flag(
-                "WARN",
-                "hf",
-                f"torch-spyre is {commit[:12]}, not the issue's {TS_SHA[:8]} "
-                f"(it contains it, {ahead} commits newer)",
-            )
-        else:
-            flag("WARN", "hf", f"torch-spyre is {str(commit)[:12]}, not the issue's {TS_SHA[:8]}")
+    _check_latest(env, "torch-spyre", "torch-spyre", "both")
 
 
 def _check_hf(env: dict) -> None:
@@ -203,14 +244,7 @@ def _check_hf(env: dict) -> None:
     if not hf:
         flag("ERROR", "hf", "hf-adapters (hf-adapters-spyre) is not installed")
         return
-    commit = hf.get("commit") or ""
-    if commit != HF_SHA and not (hf.get("built_from") and HF_SHA.startswith(hf["built_from"])):
-        flag(
-            "WARN",
-            "hf",
-            f"hf-adapters is at {commit[:12] or hf['version']}, not the issue's "
-            f"{HF_SHA[:7]} (PR #620)",
-        )
+    _check_latest(env, "hf-adapters-spyre", "hf-adapters", "hf")
     if hf.get("dirty"):
         flag(
             "WARN",
@@ -274,32 +308,26 @@ def _check_main(env: dict, ref: str) -> None:
     if not checkout:
         flag("ERROR", "main", "the main arm needs spyre-inference installed from a git checkout")
         return
-    git = ("git", "-C", checkout)
+    git, repo = ("git", "-C", checkout), UPSTREAM["spyre-inference"]
     if ref == "auto":
-        remotes = (_run(*git, "remote", "-v") or "").splitlines()
-        names = sorted(
-            {r.split()[0] for r in remotes if re.search(rf"[/:]{UPSTREAM}(\.git)?\s", r)}
-        )
-        if not names:
-            flag("ERROR", "main", f"no remote of {checkout} points at {UPSTREAM}; pass --main-ref")
+        remote = _upstream_remote(checkout, repo)
+        if not remote:
+            flag("ERROR", "main", f"no remote of {checkout} points at {repo}; pass --main-ref")
             return
-        ref = f"{names[0]}/main"
+        ref = f"{remote}/main"
     sha = _run(*git, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
     if not sha:
         flag("ERROR", "main", f"--main-ref {ref} does not resolve in {checkout}")
         return
     main = {"ref": ref, "commit": sha, "subject": _run(*git, "log", "-1", "--format=%s", sha)}
     env["spyre-inference-main"] = main
-    remote_head = _run(
-        "timeout", "20", "git", "ls-remote", f"https://github.com/{UPSTREAM}.git", "refs/heads/main"
-    )
-    if remote_head:
-        main["github_main"] = remote_head.split()[0]
-        if main["github_main"] != sha:
+    if github_main := _github_main(repo):
+        main["github_main"] = github_main
+        if github_main != sha:
             flag(
                 "WARN",
                 "main",
-                f"{ref} is {sha[:12]} but GitHub main is {main['github_main'][:12]}: "
+                f"{ref} is {sha[:12]} but GitHub main is {github_main[:12]}: "
                 "the main arm would measure a stale main (fetch it yourself)",
             )
     else:
@@ -362,7 +390,7 @@ def main() -> int:
         for dist, module in PACKAGES.items():
             env[dist] = _package(dist, module)
         env["torch-spyre"]["c_so"] = os.path.join(os.path.dirname(torch_spyre.__file__), "_C.so")
-        _check_torch_spyre(env, arms, args.allow_profiler)
+        _check_torch_spyre(env, args.allow_profiler)
         _requirements(env, "torch-spyre", "torch", "both")
         if "hf" in arms:
             _check_hf(env)

@@ -42,6 +42,7 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
 from spyre_inference import envs
 
 if TYPE_CHECKING:
+    from torch_spyre._C import SpyreTensorLayout
     from vllm.model_executor.layers.fused_moe.routed_experts import (
         RoutedExperts as _RoutedExperts,
     )
@@ -50,10 +51,16 @@ if TYPE_CHECKING:
         spyre_moe_recipe: SpyreMoERecipe
         spyre_moe_regions: dict[str, Any]
         spyre_moe_stick: int
+        spyre_moe_chunks: int
         spyre_moe_route_dtype: torch.dtype
         spyre_moe_gate: torch.Tensor
         spyre_moe_up: torch.Tensor
         spyre_moe_down: torch.Tensor
+        spyre_moe_gate_alias: torch.Tensor
+        spyre_moe_up_alias: torch.Tensor
+        spyre_moe_down_alias: torch.Tensor
+        spyre_moe_chunk_scale: torch.Tensor
+        spyre_moe_chunk_offsets: torch.Tensor
         spyre_moe_route_identity: torch.Tensor
 
 
@@ -61,6 +68,51 @@ logger = init_logger(__name__)
 
 _MOE_COMPILER_CONFIG = {"frontend_pool_allocation": True}
 _PERSISTENT_COMPILER_CONFIG = {"allow_all_ops_in_lx_planning": True}
+
+
+def _derive_moe_chunks(
+    hidden: int,
+    top_k: int,
+    stick: int,
+    max_cores: int,
+    override: int | None = None,
+) -> int:
+    """Choose the fewest stick-legal chunks that spread the gathered entries over the most cores.
+
+    The gathered kernel splits work only across its ``top_k * chunks`` entries. A core holds
+    ``top_k * hidden * inter / cores_used`` weight elements whatever the chunk count, so the
+    split that fills the most cores also has the smallest per-core working set.
+    """
+    if hidden <= 0 or top_k <= 0 or stick <= 0:
+        raise ValueError("MoE chunk selection requires positive dimensions, top_k, and stick size")
+    if max_cores <= 0:
+        raise ValueError(f"MoE chunk selection requires at least one core, got {max_cores}")
+    if hidden % stick:
+        raise ValueError(
+            f"Spyre MoE hidden size {hidden} must be a multiple of {stick}-element sticks."
+        )
+    if override is not None:
+        if override <= 0:
+            raise ValueError(f"SPYRE_MOE_CHUNKS must be positive, got {override}")
+        if hidden % (override * stick):
+            raise ValueError(
+                f"SPYRE_MOE_CHUNKS={override} requires hidden size {hidden} to split into "
+                f"{override} whole {stick}-element-stick chunks."
+            )
+        return override
+
+    hidden_sticks = hidden // stick
+    best_cores, best_chunks = 0, 1
+    for chunks in range(1, hidden_sticks + 1):
+        if hidden_sticks % chunks:
+            continue
+        entries = top_k * chunks
+        cores_used = max(
+            split for split in range(1, min(entries, max_cores) + 1) if entries % split == 0
+        )
+        if cores_used > best_cores:
+            best_cores, best_chunks = cores_used, chunks
+    return best_chunks
 
 
 @dataclass(frozen=True)
@@ -188,13 +240,6 @@ def _routing_weights(
     return weights, indices
 
 
-def _gather_indices(indices: torch.Tensor, top_k: int, stick: int) -> torch.Tensor:
-    tokens = indices.shape[0]
-    widened = indices[..., None].expand(tokens, top_k, stick).contiguous()
-    address = widened.to(torch.float32)[..., : stick // 2].to(torch.int32)
-    return address[..., 0]
-
-
 def _activation(x: torch.Tensor, up: torch.Tensor, activation: str) -> torch.Tensor:
     if activation == "gelu_tanh":
         return F.gelu(x, approximate="tanh") * up
@@ -208,21 +253,65 @@ def _moe_gathered(
     up: torch.Tensor,
     down: torch.Tensor,
     top_k: int,
+    chunks: int,
     stick: int,
     reduce_dtype: torch.dtype,
     routing: str,
     activation: str,
+    *,
+    chunk_scale: torch.Tensor,
+    chunk_offsets: torch.Tensor,
 ) -> torch.Tensor:
     tokens, hidden = x.shape
-    weights, indices = _routing_weights(router_logits, top_k, routing, reduce_dtype)
-    indices = _gather_indices(indices, top_k, stick)
-    rows, inter = tokens * top_k, gate.shape[-1]
-    inputs = x[:, None, :].expand(tokens, top_k, hidden).contiguous().reshape(rows, 1, hidden)
-    gate_out = torch.bmm(inputs, gate[indices].reshape(rows, hidden, inter))
-    up_out = torch.bmm(inputs, up[indices].reshape(rows, hidden, inter))
-    expert_out = torch.bmm(
-        _activation(gate_out, up_out, activation), down[indices].reshape(rows, inter, hidden)
-    ).reshape(tokens, top_k, hidden)
+    if hidden % chunks:
+        raise ValueError(
+            f"gathered MoE hidden size {hidden} must divide evenly into {chunks} chunks"
+        )
+    if gate.ndim != 3 or gate.shape[0] % chunks:
+        raise ValueError(
+            "gathered gate pool must have chunked [E*chunks, hidden/chunks, inter] shape"
+        )
+    slice_rows = hidden // chunks
+    experts = gate.shape[0] // chunks
+    inter = gate.shape[-1]
+    expected_gate_shape = (experts * chunks, slice_rows, inter)
+    if gate.shape != expected_gate_shape or up.shape != expected_gate_shape:
+        raise ValueError(
+            f"gathered gate/up pools must have shape {expected_gate_shape}, "
+            f"got gate={tuple(gate.shape)}, up={tuple(up.shape)}"
+        )
+    expected_down_shape = (experts * chunks, inter, slice_rows)
+    if down.shape != expected_down_shape:
+        raise ValueError(
+            f"gathered down pool must have chunked shape {expected_down_shape}, "
+            f"got {tuple(down.shape)}"
+        )
+    weights, raw_indices = _routing_weights(router_logits, top_k, routing, reduce_dtype)
+    rows = tokens * top_k
+    # Entry e*chunks+c selects chunk c of expert e, in (row, chunk) order. Broadcasting against
+    # the [1, chunks, 1] device offsets, not a cat of per-chunk index tensors, keeps the region
+    # one kernel without per-call constants.
+    expert_fp32 = (
+        raw_indices.reshape(-1)[:, None].expand(rows, stick).contiguous().to(torch.float32)
+    )
+    entries = (expert_fp32[:, None, :] * chunk_scale + chunk_offsets).reshape(rows * chunks, stick)
+    slice_index = entries[..., : stick // 2].to(torch.int32)[:, 0]
+    inputs = (
+        x.reshape(tokens, 1, chunks, slice_rows)
+        .expand(tokens, top_k, chunks, slice_rows)
+        .contiguous()
+        .reshape(rows * chunks, 1, slice_rows)
+    )
+    gate_out = torch.bmm(inputs, gate[slice_index].reshape(rows * chunks, slice_rows, inter))
+    up_out = torch.bmm(inputs, up[slice_index].reshape(rows * chunks, slice_rows, inter))
+    if chunks > 1:
+        gate_out = gate_out.reshape(rows, chunks, 1, inter).sum(dim=1)
+        up_out = up_out.reshape(rows, chunks, 1, inter).sum(dim=1)
+    activated = _activation(gate_out, up_out, activation)
+    act_rep = activated[:, None].expand(rows, chunks, 1, inter).reshape(rows * chunks, 1, inter)
+    # Output chunk c of every row is the c-th hidden slice, so the parts reshape in place.
+    parts = torch.bmm(act_rep, down[slice_index].reshape(rows * chunks, inter, slice_rows))
+    expert_out = parts.reshape(tokens, top_k, hidden)
     return (expert_out * weights[..., None]).sum(dim=1)
 
 
@@ -267,6 +356,7 @@ def _name_persistent_dims(
         name_tensor_dims,
     )
 
+    # Whole-expert pools [E, hidden, inter] / [E, inter, hidden].
     experts, hidden, inter = gate.shape
     for name, extent in (
         ("E", experts),
@@ -290,6 +380,7 @@ def _moe_persistent(
     down: torch.Tensor,
     activation: str,
 ) -> torch.Tensor:
+    # Process routed experts over token tiles using the persistent weight pools.
     from torch_spyre._inductor.propagate_hints import spyre_hint
     from torch_spyre._inductor.wsr import for_each_tile
 
@@ -348,17 +439,26 @@ def _moe_persistent_in_graph(
 
 def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
     recipe = layer.spyre_moe_recipe
+    chunks = layer.spyre_moe_chunks
+    gate, up, down = (
+        layer.spyre_moe_gate_alias,
+        layer.spyre_moe_up_alias,
+        layer.spyre_moe_down_alias,
+    )
     return _moe_gathered(
         x,
         router_logits,
-        layer.spyre_moe_gate,
-        layer.spyre_moe_up,
-        layer.spyre_moe_down,
+        gate,
+        up,
+        down,
         layer.top_k,
+        chunks,
         layer.spyre_moe_stick,
         layer.spyre_moe_route_dtype,
         recipe.routing,
         recipe.activation,
+        chunk_scale=layer.spyre_moe_chunk_scale,
+        chunk_offsets=layer.spyre_moe_chunk_offsets,
     )
 
 
@@ -434,19 +534,112 @@ def _reset_named_dims() -> None:
     reset()
 
 
-def _to_spyre_expert_weight(weight: torch.Tensor, pad: tuple[int, ...]) -> torch.Tensor:
-    """Move one expert stack to the device in the gather-friendly MoE layout.
+def _expert_kernel_layout(weight: torch.Tensor) -> SpyreTensorLayout:
+    """``[E, C, F]`` as ``[E, F // stick, C, stick]``, the nn.Linear order (torch-spyre #1339)."""
+    from torch_spyre._C import SpyreTensorLayout
 
-    ``dma_moe_expert_weight_to_spyre`` takes an ``[E, C, F]`` stack whose free dim spans
-    whole sticks; ``pad`` is the ``F.pad`` spec that widens it to one.
-    """
+    return SpyreTensorLayout(list(weight.shape), list(weight.stride()), weight.dtype, [1, 0, 2])
+
+
+def _to_spyre_expert_weight(
+    weight: torch.Tensor, pad: tuple[int, ...], *, kernel_order: bool = False
+) -> torch.Tensor:
+    """Move an ``[E, C, F]`` expert stack, widened by the ``F.pad`` spec ``pad``, to the device."""
     from torch_spyre.model_utils import dma_moe_expert_weight_to_spyre
 
     if any(pad):
         weight = F.pad(weight, pad)
-    moved = dma_moe_expert_weight_to_spyre(weight)
-    assert moved is not None
-    return moved
+    if not kernel_order:
+        moved = dma_moe_expert_weight_to_spyre(weight)
+        assert moved is not None
+        return moved
+    if not torch.spyre.is_initialized():
+        torch.empty(0, dtype=weight.dtype, device="spyre")
+    weight = weight.contiguous()
+    layout = _expert_kernel_layout(weight)
+    assert weight.shape[-1] % layout.elems_per_stick() == 0, "the free dim must span whole sticks"
+    # Lands on the current Spyre device, as the ``dma_*`` helpers do.
+    return weight.to(device_layout=layout)  # ty: ignore[no-matching-overload]
+
+
+def _chunk_entry_constants(chunks: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Device scale and offsets of the gathered entry index ``e*chunks + c``.
+
+    Inputs rather than in-graph scalars, so the region needs no per-call constants; the
+    size-1 stick dim lets them broadcast against the widened fp32 expert index.
+    """
+    scale = torch.full((1, 1, 1), float(chunks), dtype=torch.float32).to("spyre")
+    offsets = torch.arange(chunks, dtype=torch.float32).reshape(1, chunks, 1).to("spyre")
+    return scale, offsets
+
+
+def _check_pool_layout(pool: torch.Tensor, expected: SpyreTensorLayout) -> None:
+    from torch_spyre._C import get_spyre_tensor_layout
+
+    actual = get_spyre_tensor_layout(pool)
+    if (actual.device_size, actual.stride_map) != (expected.device_size, expected.stride_map):
+        raise RuntimeError(
+            f"MoE pool device layout {actual.device_size} / {actual.stride_map} differs from "
+            f"the {expected.device_size} / {expected.stride_map} its chunk alias reinterprets."
+        )
+
+
+def _chunk_pool_alias(pool: torch.Tensor, chunks: int) -> torch.Tensor:
+    """Expose a whole-expert [E, contract, free] pool as [E*chunks, contract/chunks, free].
+
+    The view shares storage; entry e*chunks+c selects chunk c of expert e. The contract axis
+    is outer to the free-dim sticks, so chunking it preserves flat physical order.
+    """
+    from torch_spyre import _C
+    from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+
+    experts, contract, free = pool.shape
+    if contract % chunks:
+        raise ValueError(f"gate/up contract dim {contract} must divide into {chunks} chunks")
+    eps = SpyreTensorLayout([experts, contract, free], pool.dtype).elems_per_stick()
+    device_dtype = get_device_dtype(pool.dtype)
+    _check_pool_layout(
+        pool,
+        SpyreTensorLayout(
+            [experts, contract, free // eps, eps], [contract * free, free, eps, 1], device_dtype
+        ),
+    )
+    c4 = contract // chunks
+    layout = SpyreTensorLayout(
+        [experts * chunks, c4, free // eps, eps],
+        [c4 * free, free, eps, 1],
+        device_dtype,
+    )
+    return _C.reinterpret_tensor_with_layout(
+        pool,
+        [experts * chunks, c4, free],
+        [c4 * free, free, 1],
+        0,
+        layout,
+    )
+
+
+def _down_chunk_pool_alias(pool: torch.Tensor, chunks: int) -> torch.Tensor:
+    """Expose down weights as expert-major [E*chunks, M, H/chunks] entries.
+
+    The view shares storage. Each e*chunks+c entry selects output chunk c for expert e.
+    The H-stick axis is outer to M, so chunking it preserves flat physical order.
+    """
+    from torch_spyre import _C
+    from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
+
+    experts, inter, hidden = pool.shape
+    stick = get_elem_in_stick(pool.dtype)
+    if hidden % chunks or (hidden // chunks) % stick:
+        raise ValueError(
+            f"down hidden size {hidden} must divide into {chunks} stick-aligned chunks"
+        )
+    _check_pool_layout(pool, _expert_kernel_layout(pool))
+    chunk_hidden = hidden // chunks
+    size = [experts * chunks, inter, chunk_hidden]
+    stride = [inter * chunk_hidden, chunk_hidden, 1]
+    layout = SpyreTensorLayout(size, stride, pool.dtype, [1, 0, 2])
+    return _C.reinterpret_tensor_with_layout(pool, size, stride, 0, layout)
 
 
 def _prepare_layer(layer: RoutedExperts) -> None:
@@ -467,23 +660,39 @@ def _prepare_layer(layer: RoutedExperts) -> None:
             f"unexpected MoE expert weight shapes: w13={tuple(w13.shape)} w2={w2_shape}"
         )
 
-    # TP divides ``inter`` by the rank count, so it need not span whole sticks. Widening
-    # is inert: the added lanes activate to zero, against zero rows of ``down``.
+    from torch_spyre._inductor import config as spyre_config
+
+    # All shape and alignment checks run before the first device relayout.
     stick = get_elem_in_stick(w13.dtype)
-    if hidden % stick:
-        raise ValueError(
-            f"Spyre MoE down expert-stack free dim {hidden} is not a multiple of "
-            f"the {stick}-element stick; hidden_size must be stick-aligned."
-        )
+    chunks = _derive_moe_chunks(
+        hidden, layer.top_k, stick, spyre_config.sencores, envs.SPYRE_MOE_CHUNKS
+    )
+    # TP can leave intermediate shards mid-stick; zero-padding is inert because those
+    # activation lanes multiply zero rows in the down stack.
     pad = -inter % stick
+    # Share gate/up allocations between persistent and gathered chunk views.
     layer.spyre_moe_gate = _to_spyre_expert_weight(w13[:, :inter, :].transpose(1, 2), (0, pad))
     layer.spyre_moe_up = _to_spyre_expert_weight(w13[:, inter:, :].transpose(1, 2), (0, pad))
+    layer.spyre_moe_chunks = chunks
+    layer.spyre_moe_gate_alias = _chunk_pool_alias(layer.spyre_moe_gate, chunks)
+    layer.spyre_moe_up_alias = _chunk_pool_alias(layer.spyre_moe_up, chunks)
     del layer.w13_weight, w13
     w2 = layer.get_parameter("w2_weight").data
     transform_down = layer.spyre_moe_recipe.prepare_down_weight
     if transform_down is not None:
         w2 = transform_down(w2)
-    layer.spyre_moe_down = _to_spyre_expert_weight(w2.transpose(1, 2), (0, 0, 0, pad))
+    # Keep the complete stack for persistent compute and expose a view for gathered decode.
+    layer.spyre_moe_down = _to_spyre_expert_weight(
+        w2.transpose(1, 2), (0, 0, 0, pad), kernel_order=True
+    )
+    layer.spyre_moe_down_alias = _down_chunk_pool_alias(layer.spyre_moe_down, chunks)
+    layer.spyre_moe_chunk_scale, layer.spyre_moe_chunk_offsets = _chunk_entry_constants(chunks)
+    logger.info_once(
+        "Spyre MoE: selected %d gathered weight chunks (top_k=%d, cores=%d).",
+        chunks,
+        layer.top_k,
+        spyre_config.sencores,
+    )
     del layer.w2_weight, w2
 
     dtype = layer.spyre_moe_gate.dtype
@@ -532,8 +741,11 @@ class SpyreMoERunner(MoERunner):
 class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     """OOT bridge from vLLM's unquantized MoE method to ``SpyreMoERecipe``."""
 
-    # The source expert parameters are replaced with device-specific stacks.
-    supports_pre_processed_weights = False
+    def __init__(self, moe) -> None:
+        super().__init__(moe)
+        # The source expert parameters are replaced with device-specific stacks. Set
+        # after super().__init__, which since 0.31 assigns this per instance.
+        self.supports_pre_processed_weights = False
 
     @property
     def is_monolithic(self) -> bool:
