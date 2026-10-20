@@ -29,6 +29,8 @@ import torch
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor import spyre_hint
 
+from spyre_inference.v1.attention.ops.page_attn_head_major_prefill import prefill_work_div
+
 # For this kernel, the co-optimizer still needs some fine-tuning before it can
 # reach the best performance. Until then, disable it and use the greedy solver
 # instead, to enforce our hand-picked work-division/layout choices below. Forced
@@ -55,7 +57,6 @@ def page_attn_head_major_prefill_unroll_kernel(
     num_heads,
     num_kv_heads,
     head_size,
-    block_size,
     logits_soft_cap=0.0,
     out=None,
 ):
@@ -68,7 +69,8 @@ def page_attn_head_major_prefill_unroll_kernel(
         mask_stack: [num_blocks, padded_query_len, block_size].
     """
     num_queries_per_kv = num_heads // num_kv_heads
-    matmul_split = {"T": 8, "Hkv": 4} if num_kv_heads % 4 == 0 else {"T": 8}
+    hkv_split, t_split = prefill_work_div(num_kv_heads, padded_query_len)
+    matmul_split = {"T": t_split, "Hkv": hkv_split}
 
     # Gathered, not sliced outside: since torch-spyre#4449 a view's storage_offset is a
     # Dynamo graph guard, and q_start varies, so a slice would compile one kernel per batch
