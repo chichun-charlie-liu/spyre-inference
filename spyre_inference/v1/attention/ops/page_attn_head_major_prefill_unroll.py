@@ -26,22 +26,20 @@ for the dispatch.
 """
 
 import torch
-from torch_spyre._inductor import config as _spyre_config
+from torch_spyre._inductor import config as _spyre_config  # noqa: F401
 from torch_spyre._inductor import spyre_hint
 
 from spyre_inference.v1.attention.ops.page_attn_head_major_prefill import prefill_work_div
 
-# For this kernel, the co-optimizer still needs some fine-tuning before it can
-# reach the best performance. Until then, disable it and use the greedy solver
-# instead, to enforce our hand-picked work-division/layout choices below. Forced
-# regardless of what LAYOUT_SOLVER/CO_OPTIMIZING_LX_PLANNING the environment or
-# caller has set. Module scope, not inside the kernel: the config is read during
-# Inductor's compile pass, not necessarily inside the traced frame, so setting it
-# here (only reached when this module is actually imported, i.e. when
-# USE_FOR_EACH_TILE selects this kernel -- see spyre_head_major_attn.py's lazy
-# import) is both correct and matches the real, verified upstream source exactly.
-_spyre_config.co_optimizing_lx_planning = False
-_spyre_config.layout_solver = "greedy"
+# Greedy, co-optimizer off: ~5% faster, mostly from splitting a query copy over 32
+# cores, not 1. But these writes are process-wide, so they switch the whole model to
+# greedy, which seems to avoid the bug test_kernel_cache's fresh-lowering strict xfail
+# expects, making it XPASS. This option is disabled, i.e. commented out, for now
+# because this kernel is opt-in and an alternative to the default, and that test's
+# intent under other solvers is unclear. May re-enable if the test's intent is
+# clarified or the targeted bug is resolved; keep it at module scope.
+# _spyre_config.co_optimizing_lx_planning = False
+# _spyre_config.layout_solver = "greedy"
 
 
 def page_attn_head_major_prefill_unroll_kernel(
