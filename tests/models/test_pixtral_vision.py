@@ -213,10 +213,10 @@ def test_rope_tables_match_upstream_complex_rope():
 def test_upstream_tower_contract_is_unchanged():
     """What the Spyre blocks still take from upstream's: the constructors, the submodules the
     residual path calls and the attention's projections. Diff it on a vLLM bump."""
-    for cls in (pixtral.TransformerBlock, pixtral.Attention):
-        params = list(inspect.signature(cls.__init__).parameters)
-        assert params == ["self", "args", "quant_config", "prefix", "disable_tp"], cls
-    block = pixtral.TransformerBlock(_args(), disable_tp=True)
+    params = list(inspect.signature(pixtral.Attention.__init__).parameters)
+    assert params == ["self", "args", "quant_config", "prefix", "disable_tp"]
+    # TransformerBlock's signature is support_torch_compile's wrapper; construct it instead.
+    block = pixtral.TransformerBlock(_args(), quant_config=None, prefix="", disable_tp=True)
     for name in ("attention", "attention_norm", "feed_forward", "ffn_norm"):
         assert hasattr(block, name), f"upstream TransformerBlock no longer has {name}"
     for name in ("qkv_proj", "o_proj", "n_heads", "head_dim"):
@@ -377,3 +377,21 @@ def test_gather_table_gathers_exact_rows_on_spyre():
     assert torch.equal(eager, rows)
     assert torch.equal(compiled, rows)
     torch.testing.assert_close(rows, host[index], atol=4e-3, rtol=1e-3)
+
+
+def test_block_compile_is_honoured(tp_group):
+    """Upstream's ``support_torch_compile`` ``__call__`` must not bypass the graph that
+    ``block.compile`` installs."""
+    block = _spyre_model(_args(), dtype=torch.float32).vision_encoder.transformer.layers[0]
+    graphs = []
+
+    def backend(gm, example_inputs):
+        graphs.append(gm)
+        return gm.forward
+
+    block.compile(backend=backend, fullgraph=True, dynamic=False)
+    head_dim = block.attention.head_dim
+    x = torch.randn(1, 4, block.attention.n_heads * head_dim)
+    mask = torch.ones(1, 1, 4, 4, dtype=torch.bool)
+    block(x, mask, (torch.ones(4, head_dim), torch.zeros(4, head_dim)))
+    assert graphs

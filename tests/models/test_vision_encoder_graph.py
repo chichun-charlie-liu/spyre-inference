@@ -139,8 +139,8 @@ def test_execute_packs_pads_per_block_and_splits_per_item():
     model.forward_patches.clear()
     outputs = manager.execute({"tokens": [10, 30]})
 
-    # 40 tokens pack into the 64-token budget: one compiled call at 256 patches.
-    assert model.forward_patches == [64 * MERGE_PATCHES]
+    # Upstream splits rather than pad both items into 64: the 16 and 32 budgets sum to less.
+    assert model.forward_patches == [16 * MERGE_PATCHES, 32 * MERGE_PATCHES]
     assert [o.shape[0] for o in outputs] == [10, 30]
     for i, out in enumerate(outputs):
         assert out.device.type == "cpu"

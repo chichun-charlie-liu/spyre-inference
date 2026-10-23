@@ -301,8 +301,8 @@ def test_spyre_indirect_matmul_tensor_index(spyre_device):
     Was xfail(strict=True) for diverging from CPU silently; fixed in the torch-spyre
     f4f0bcc..9f975a3 range. The kernels still pass a one-element index, for unrelated
     reasons still probed by test_spyre_indirect_page_gather_subscript_needs_compile
-    (int32 index upcast under aten.index) and test_spyre_compile_input_honors_storage_offset
-    (torch-spyre#3770).
+    (int32 index upcast under aten.index) and test_spyre_scatter_index_row_of_2d_table
+    (torch-spyre#3851).
     """
     num_kv_heads = 2
     block_size = 64
@@ -621,29 +621,14 @@ def test_spyre_scatter_from_prefix_view_source(spyre_device, source):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "dtype",
-    [
-        torch.float16,
-        pytest.param(
-            torch.int32,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "torch-spyre#3770: an int32 device view with storage_offset != 0 is "
-                    "read from offset 0 when passed into a compiled region. Index tensors "
-                    "are int32, hence the per-sequence page_index_tables."
-                ),
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.int32])
 def test_spyre_compile_input_honors_storage_offset(spyre_device, dtype):
     """A compiled kernel must read a device input from its own storage offset.
 
     These views are is_contiguous(), so .contiguous() is a no-op; only a real copy works.
     Every offset here is a whole number of sticks, so a pass does not speak for a
-    row-misaligned view.
+    row-misaligned view. For int32 this covers an elementwise read only, not an index
+    (test_spyre_scatter_index_row_of_2d_table).
     """
     rows, width = 4, 64
     base_cpu = torch.stack([torch.full((rows, width), float(s)) for s in range(3)]).to(dtype)
@@ -883,8 +868,8 @@ def _stacked_index_pages(blocks, entries, block_size, head_size, spyre_device):
 def test_spyre_in_graph_slice_of_stacked_page_index(spyre_device):
     """One stacked [num_blocks, 1] int32 table, sliced in-graph, feeding index_select.
 
-    An int32 argument's offset is dropped
-    (test_spyre_compile_input_honors_storage_offset[dtype1]); an in-graph slice of a
+    An index that is a row of a 2-D table argument loses all but its first stick
+    (test_spyre_scatter_index_row_of_2d_table); an in-graph slice of a
     stacked table is a different mechanism and holds at this shape, which is what
     ``page_attn_head_major_prefill`` reads.
     """
@@ -936,6 +921,39 @@ def test_spyre_in_graph_slice_of_stacked_kv_row_index(spyre_device):
         for b in range(blocks)
     )
     torch.testing.assert_close(fn(pages, table).cpu(), expected, atol=0, rtol=0)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "torch-spyre#3851: an index that is a row of a 2-D table is followed for its first "
+        "int32 stick only; the entries past it are dropped, silently. Offset 0 fails too."
+    ),
+)
+def test_spyre_scatter_index_row_of_2d_table(spyre_device):
+    """index_copy_ with row 0 of a [2, 64] table, the form a [KV, T] head-major write index takes.
+
+    When this XPASS-es, SpyreHeadMajorAttentionImpl.kv_write_index can upload one [KV, T]
+    tensor and hand the store its rows, instead of one allocation and H2D copy per KV head.
+    """
+    rows, entries, width = 128, 64, 128
+    table_cpu = torch.stack([torch.arange(entries) * 2, torch.arange(entries) * 2 + 1])
+    table = table_cpu.to(spyre_device)
+    source_cpu = (1 + torch.arange(entries, dtype=torch.float16)).unsqueeze(1).expand(-1, width)
+    source = source_cpu.contiguous().to(spyre_device)
+    out = torch.zeros(rows, width, dtype=torch.float16).to(spyre_device)
+
+    @torch.compile(dynamic=False)
+    def fn(o, i, s):
+        o.index_copy_(0, i, s)
+
+    index = table[0]
+    assert index.storage_offset() == 0
+    fn(out, index, source)
+    expected = torch.zeros(rows, width, dtype=torch.float16).index_copy_(
+        0, table_cpu[0], source_cpu
+    )
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
 
 
 # ---------------------------------------------------------------------------

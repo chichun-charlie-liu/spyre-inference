@@ -106,6 +106,10 @@ class SpyrePixtralTransformerBlock(pixtral.TransformerBlock):
     the same-image mask built once per encoder call in ``vision_embed``.
     """
 
+    # Upstream's support_torch_compile __call__ runs forward directly, skipping the graph
+    # block.compile installs; the Spyre encoder compiles each block itself.
+    __call__ = nn.Module.__call__
+
     def __init__(self, args, prefix: str = "", disable_tp: bool = False) -> None:
         super().__init__(args, prefix=prefix, disable_tp=disable_tp)
         self.attention = SpyrePixtralAttention(

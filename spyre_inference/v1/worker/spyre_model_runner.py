@@ -49,7 +49,6 @@ from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import Attention
-from vllm.model_executor.layers.pooler.seqwise.poolers import SequencePooler
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.utils import get_model_architecture
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
@@ -104,13 +103,14 @@ from spyre_inference.v1.pool import (
     copy_pooler_output_to_cpu,
     select_rows,
 )
+from spyre_inference.v1.pool.encoder_grid import (
+    pool_rows_for,
+    unpad_encoder_grid,
+)
 from spyre_inference.v1.pool.spyre_pooler import (
     SpyreClassifierLinear,
-    SpyreCLSPool,
-    SpyreDispatchPooler,
     SpyreEmbeddingPoolerHead,
     SpyreMeanPool,
-    SpyrePoolingCursor,
     SpyreRobertaClassificationHead,
     _iter_modules,
     _mean_pool_grid_reduce,
@@ -124,10 +124,13 @@ from spyre_inference.v1.worker.encoder_grid import (
     encoder_pad_token_id,
     expand_body_to_grid,
 )
+from spyre_inference.v1.worker.kv_cache_setup import (
+    allocate_spyre_kv_caches,
+    split_attn_groups_by_window,
+)
 from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
-    encoder_cls_rows,
     encoder_group_shapes,
     encoder_group_width_caps,
     encoder_len_ladder,
@@ -153,10 +156,8 @@ def _compute_slot_mapping_impl(
     positions: torch.Tensor,
     block_table: torch.Tensor,
     block_table_stride: int,
-    block_size: int,
     slot_mapping: torch.Tensor,
-    KV_CACHE_BLOCK_SIZE: int | None = None,
-    BLOCKS_PER_KV_BLOCK: int = 1,
+    KV_CACHE_BLOCK_SIZE: int,
     TOTAL_CP_WORLD_SIZE: int = 1,
     TOTAL_CP_RANK: int = 0,
     CP_KV_CACHE_INTERLEAVE_SIZE: int = 1,
@@ -172,17 +173,12 @@ def _compute_slot_mapping_impl(
 
     Correctness is validated indirectly by the upstream attention backend test
     (test_causal_backend_correctness) and end-to-end model generation tests.
-
-    ``block_size`` is the kernel's block size, ``KV_CACHE_BLOCK_SIZE`` the KV
-    manager's, and ``BLOCKS_PER_KV_BLOCK`` the ratio between them (1 on Spyre).
     """
     assert TOTAL_CP_WORLD_SIZE == 1, "Context Parallelism is not supported on Spyre."
-    kv_block_size = block_size if KV_CACHE_BLOCK_SIZE is None else KV_CACHE_BLOCK_SIZE
 
     token_positions = positions[:num_tokens]
-    virtual_block_indices = (token_positions // kv_block_size).to(torch.int64)
-    local_block_offsets = (token_positions % kv_block_size).to(torch.int64)
-    block_indices = virtual_block_indices * BLOCKS_PER_KV_BLOCK + local_block_offsets // block_size
+    block_indices = (token_positions // KV_CACHE_BLOCK_SIZE).to(torch.int64)
+    block_offsets = (token_positions % KV_CACHE_BLOCK_SIZE).to(torch.int64)
 
     num_reqs = query_start_loc.shape[0] - 1
     req_indices = torch.empty(num_tokens, dtype=torch.int64, device=positions.device)
@@ -193,7 +189,7 @@ def _compute_slot_mapping_impl(
 
     flat_indices = req_indices * block_table_stride + block_indices
     block_numbers = block_table.flatten()[flat_indices].to(torch.int64)
-    slot_mapping[:num_tokens] = block_numbers * block_size + local_block_offsets % block_size
+    slot_mapping[:num_tokens] = block_numbers * KV_CACHE_BLOCK_SIZE + block_offsets
     if num_tokens < max_num_tokens:
         slot_mapping[num_tokens:max_num_tokens] = PAD_ID
 
@@ -211,10 +207,8 @@ class _SlotMappingKernelShim:
         positions: torch.Tensor,
         block_table: torch.Tensor,
         block_table_stride: int,
-        block_size: int,
         slot_mapping: torch.Tensor,
-        KV_CACHE_BLOCK_SIZE: int | None = None,
-        BLOCKS_PER_KV_BLOCK: int = 1,
+        KV_CACHE_BLOCK_SIZE: int,
         TOTAL_CP_WORLD_SIZE: int = 1,
         TOTAL_CP_RANK: int = 0,
         CP_KV_CACHE_INTERLEAVE_SIZE: int = 1,
@@ -226,10 +220,8 @@ class _SlotMappingKernelShim:
             positions,
             block_table,
             block_table_stride,
-            block_size,
             slot_mapping,
-            KV_CACHE_BLOCK_SIZE=KV_CACHE_BLOCK_SIZE,
-            BLOCKS_PER_KV_BLOCK=BLOCKS_PER_KV_BLOCK,
+            KV_CACHE_BLOCK_SIZE,
             TOTAL_CP_WORLD_SIZE=TOTAL_CP_WORLD_SIZE,
             TOTAL_CP_RANK=TOTAL_CP_RANK,
             CP_KV_CACHE_INTERLEAVE_SIZE=CP_KV_CACHE_INTERLEAVE_SIZE,
@@ -763,6 +755,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # an nn.Module, but just the attention implementation.
         Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
 
+        # Before any trace: resolved lazily inside the block graph, the scales become a
+        # guard on their unset value and the first real prefill recompiles the block.
+        self._resolve_kv_scales()
+
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
         for module in self.model.modules():
@@ -835,6 +831,72 @@ class TorchSpyreModelRunner(GPUModelRunner):
             if _is_fp8_kernel(getattr(module, "scheme", None)):
                 return True
         return False
+
+    def _resolve_kv_scales(self) -> bool:
+        """Read each float8-cache layer's KV scales into its impl; True when any changed."""
+        changed = False
+        pairs = set()
+        shared = []
+        for module in self.get_model().modules():
+            impl = getattr(module, "impl", None)
+            if not (isinstance(module, Attention) and isinstance(impl, SpyreAttentionImpl)):
+                continue
+            if getattr(module, "kv_sharing_target_layer_name", None) is not None:
+                shared.append(module)
+                continue
+            if not impl.kv_cache_fp8:
+                continue
+            k_scale = getattr(module, "_k_scale", None)
+            if isinstance(k_scale, torch.Tensor) and k_scale.numel() > 1:
+                # Upstream's per-head scheme reduces the heads to their max scale, so a head
+                # with a much smaller one keeps only a few e4m3 steps of its range.
+                logger.warning_once(
+                    "The checkpoint carries per-head KV cache scales; the fp8 KV cache uses "
+                    "one scale per layer, the largest head's, which coarsens the others."
+                )
+            old = impl._kv_scales
+            impl.prepare_kv_scales(module)
+            changed |= old is not None and impl._kv_scales != old
+            pairs.add(impl._kv_scales)
+        # A sharing layer reads the cache its target wrote, so it dequantizes with the
+        # target's scales; its own usually default to 1.0, as it stores nothing.
+        static_ctx = self.compilation_config.static_forward_context if shared else {}
+        for module in shared:
+            target = static_ctx[module.kv_sharing_target_layer_name]
+            if module.impl.kv_cache_fp8 != target.impl.kv_cache_fp8:
+                # It reads the target's pages, so it must decode them in the dtype they hold.
+                raise ValueError(
+                    f"KV-sharing layer {module.layer_name} and its target "
+                    f"{module.kv_sharing_target_layer_name} disagree on the fp8 KV cache; "
+                    "list both or neither in kv_cache_dtype_skip_layers."
+                )
+            if not module.impl.kv_cache_fp8:
+                continue
+            old = module.impl._kv_scales
+            module.impl._kv_scales = target.impl._kv_scales
+            changed |= old is not None and module.impl._kv_scales != old
+        if len(pairs) > 1:
+            # The scales are graph constants, so each distinct pair is its own compile.
+            logger.warning_once(
+                "The fp8 KV cache has %d distinct per-layer (k_scale, v_scale) pairs; the "
+                "transformer block and every recorded attention kernel compile once per "
+                "pair, which lengthens warmup.",
+                len(pairs),
+            )
+        return changed
+
+    def reload_weights(self, *args, **kwargs) -> None:
+        super().reload_weights(*args, **kwargs)
+        # Upstream's reload reprocesses the weights, which rewrites the layers' KV scales.
+        # The graphs that read them guard on their values, so only those retrace; warming
+        # here does that before the next request, which an armed compile guard would fail.
+        if self._resolve_kv_scales():
+            logger.warning(
+                "KV cache scales changed on weight reload; re-warming the graphs that "
+                "depend on them."
+            )
+            with compile_guard.allow_compile("KV cache scales changed on weight reload"):
+                self.warming_up_model()
 
     def _compile_for_spyre(self) -> None:
         """Install torch.compile wrappers; tracing happens on the first forward.
@@ -1224,46 +1286,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self._split_attn_groups_by_layer_window()
 
     def _split_attn_groups_by_layer_window(self) -> None:
-        """Give each distinct per-layer sliding window its own attention group."""
-        # `FullAttentionSpec.merge` collapses a hybrid decoder onto the one window it finds,
-        # clamping its full-attention layers too (gemma-3-1b-it: 512 on all 26). Spyre masks
-        # per group, not per layer as upstream does, so the group is what has to split.
-        from dataclasses import replace
-
         from vllm.config import get_layers_from_vllm_config
-        from vllm.v1.kv_cache_interface import FullAttentionSpec
-        from vllm.v1.worker.utils import AttentionGroup
 
-        layers = get_layers_from_vllm_config(self.vllm_config, Attention)
-        for kv_cache_group_id, groups in enumerate(self.attn_groups):
-            split_groups: list[AttentionGroup] = []
-            for group in groups:
-                spec = group.kv_cache_spec
-                windows: dict[int | None, list[str]] = {}
-                for layer_name in group.layer_names:
-                    window = getattr(layers.get(layer_name), "sliding_window", None)
-                    windows.setdefault(window, []).append(layer_name)
-                # SlidingWindowSpec is single-window by construction; UniformTypeKVCacheSpecs
-                # is already unwrapped per layer upstream.
-                if not isinstance(spec, FullAttentionSpec) or len(windows) <= 1:
-                    split_groups.append(group)
-                    continue
-                logger.info(
-                    "Split %d attention layers into %d groups by sliding window %s.",
-                    len(group.layer_names),
-                    len(windows),
-                    {w: len(n) for w, n in windows.items()},
-                )
-                for window, layer_names in windows.items():
-                    split_groups.append(
-                        AttentionGroup(
-                            group.backend,
-                            layer_names,
-                            replace(spec, sliding_window=window),
-                            kv_cache_group_id,
-                        )
-                    )
-            self.attn_groups[kv_cache_group_id] = split_groups
+        split_attn_groups_by_window(
+            self.attn_groups, get_layers_from_vllm_config(self.vllm_config, Attention)
+        )
 
     def _build_attention_metadata(self, *args, **kwargs):
         """Pick the encoder path for this step and attach its plan to the metadata.
@@ -1329,7 +1356,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         num_reqs: int,
         num_scheduled_tokens_np: np.ndarray,
         max_num_scheduled_tokens: int,
-        use_cascade_attn: bool,
+        use_cascade_attn: bool = False,
         allow_microbatching: bool = True,
         force_eager: bool = False,
         force_uniform_decode: bool | None = None,
@@ -1365,7 +1392,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
             num_reqs=num_reqs,
             num_scheduled_tokens_np=num_scheduled_tokens_np,
             max_num_scheduled_tokens=max_num_scheduled_tokens,
-            use_cascade_attn=use_cascade_attn,
             allow_microbatching=allow_microbatching,
             force_eager=force_eager,
             force_uniform_decode=force_uniform_decode,
@@ -1565,7 +1591,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def _warm_encoder_unpack(self, hidden_states: torch.Tensor) -> None:
         """Compile the rectangular path's re-compaction gather.
 
-        ``_unpad_encoder_hidden`` runs in ``_pool``, which no dummy run reaches, so
+        ``unpad_encoder_grid`` runs in ``_pool``, which no dummy run reaches, so
         without this the first request needing packed-order re-compaction pays its compile.
         One shape only: the gather deliberately keeps the buffer's row count.
         """
@@ -1591,38 +1617,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         body = buffer.gpu[: self._encoder_budget]
         for extent, width in self._encoder_rectangles:
             select_rows(body, torch.zeros(width * extent, dtype=torch.int64))
-
-    def _unpad_encoder_hidden(
-        self, hidden_states: torch.Tensor, num_scheduled_tokens: int
-    ) -> torch.Tensor:
-        """Re-compact a rectangular-path grid to the packed order the poolers address.
-
-        Except for eligible homogeneous Spyre CLS and MEAN batches, poolers need
-        packed-order rows, including token-level poolers. Reporting padded lengths instead makes
-        ``PoolingCursor.is_partial_prefill()`` true and ``SpyreCLSPool`` raise.
-
-        The gather keeps its input's row count: sizing it to the real token count adds
-        a ``torch.compile`` specialisation per distinct total, recompiling nearly every
-        step once prompt lengths vary. The ragged path is already packed, and every
-        pooler either gathers by row index or crops on the host, so its trailing pad
-        needs no gather at all.
-        """
-        del num_scheduled_tokens
-        grid = self._encoder_grid
-        if grid is None:
-            return hidden_states
-        extent, width, query_lens = grid
-        # Host Python, not tensor ops: every extra CPU aten op on the per-step path
-        # lengthens the shared eager-op guard chain and costs more than the loop (#981).
-        rows_list: list[int] = []
-        for seq_idx, length in enumerate(query_lens):
-            start = seq_idx * extent
-            rows_list.extend(range(start, start + length))
-        total = width * extent
-        if len(rows_list) == total:
-            return hidden_states
-        rows_list = rows_list + [0] * (total - len(rows_list))
-        return select_rows(hidden_states, torch.tensor(rows_list, dtype=torch.int64, device="cpu"))
 
     def _preprocess(self, *args, **kwargs):
         """Expand the ragged body into the dense grid on the rectangular path.
@@ -1703,37 +1697,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
             return out
         return (out[0], out[1], offset_host_positions(positions, delta), *out[3:])
 
-    def _rectangular_pooling(
-        self, pooling_metadata: PoolingMetadata
-    ) -> SpyreCLSPool | SpyreMeanPool | None:
-        """This rectangular step's pooling method, when it can read the grid directly.
-
-        CLS takes each lane's first row and MEAN reduces each lane, so both skip the
-        unpad gather. Other poolers, including LAST and token-level ones, need packed
-        rows. Mixed-task batches also take the unpad gather so one layout serves every
-        task.
-        """
-        grid = self._encoder_grid
-        if grid is None:
-            return None
-        tasks = list(pooling_metadata.tasks)
-        if len(set(tasks)) != 1:
-            return None
-        pooler = cast(VllmModelForPooling, self.model).pooler
-        sub = pooler
-        if isinstance(pooler, SpyreDispatchPooler):
-            sub = pooler.poolers_by_task.get(tasks[0])
-            if sub is None:
-                return None
-        pooling = sub.pooling if isinstance(sub, SequencePooler) else sub
-        if not isinstance(pooling, SpyreCLSPool | SpyreMeanPool):
-            return None
-        cursor = pooling_metadata.get_pooling_cursor()
-        counts = cursor.num_scheduled_tokens_cpu if cursor is not None else None
-        if counts is None or int(counts.numel()) != len(grid[2]):
-            return None
-        return pooling
-
     def _dummy_pooler_run_task(
         self,
         hidden_states: torch.Tensor,
@@ -1797,9 +1760,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
 
         if not self._pooling_on_spyre:
-            hidden_states = self._unpad_encoder_hidden(
-                convert(hidden_states, "cpu"), num_scheduled_tokens
-            )
+            hidden_states = unpad_encoder_grid(convert(hidden_states, "cpu"), self._encoder_grid)
             return super()._pool(
                 hidden_states,
                 num_scheduled_tokens,
@@ -1827,28 +1788,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
 
         hidden_states = convert(hidden_states, self._spyre_device)
-        # Eligible homogeneous CLS reads grid rows directly and MEAN reduces each lane
-        # in place; all other poolers need packed order, including token-level ones.
-        # ``first_token_indices_gpu`` stays a host tensor, like the rest of the cursor.
-        grid = self._encoder_grid
-        rect_pooling = self._rectangular_pooling(pooling_metadata)
-        if grid is not None and isinstance(rect_pooling, SpyreCLSPool):
-            extent, _width, query_lens = grid
-            pooling_metadata.get_pooling_cursor().first_token_indices_gpu = torch.tensor(
-                encoder_cls_rows(len(query_lens), extent), dtype=torch.int64
-            )
-        elif grid is not None and isinstance(rect_pooling, SpyreMeanPool):
-            cursor = pooling_metadata.get_pooling_cursor()
-            pooling_metadata.pooling_cursor = SpyrePoolingCursor(
-                **vars(cursor), spyre_grid_extent=grid[0]
-            )
-        else:
-            # Not a crop: the row count stays the buffer's. On the rectangular path
-            # this re-compacts the grid to the packed order the cursor addresses; on
-            # the ragged path it is a no-op.
-            hidden_states = self._unpad_encoder_hidden(hidden_states, num_scheduled_tokens)
-
         model = cast(VllmModelForPooling, self.model)
+        hidden_states = pool_rows_for(
+            hidden_states, model.pooler, pooling_metadata, self._encoder_grid
+        )
+
         raw_pooler_output: PoolerOutput = model.pooler(
             hidden_states=hidden_states, pooling_metadata=pooling_metadata
         )
@@ -1908,43 +1852,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
         from vllm.v1.worker.utils import bind_kv_cache
 
         static_ctx = self.compilation_config.static_forward_context
-
-        # One spec per layer. disable_hybrid_kv_cache_manager (set in the platform)
-        # collapses hybrid models into a single group; when the layers' head shapes differ
-        # its spec is a UniformTypeKVCacheSpecs, which unwraps to the real per-layer specs
-        # so each layer keeps its own num_kv_heads/head_size. A merged spec is direct.
-        spec_by_layer = {}
-        for group in kv_cache_config.kv_cache_groups:
-            per_layer = getattr(group.kv_cache_spec, "kv_cache_specs", None)
-            if per_layer is not None:
-                spec_by_layer.update(per_layer)
-            else:
-                spec_by_layer.update({ln: group.kv_cache_spec for ln in group.layer_names})
-
         # vLLM's `bind_kv_cache` types this dict as `dict[str, torch.Tensor]`,
         # but the matching `SpyreAttentionImpl.forward` consumes the
         # SpyrePagedKVCache — see the suppression on `bind_kv_cache(...)` below.
-        kv_caches: dict[str, SpyrePagedKVCache] = {}
-
         with kv_cache_allocation_context or nullcontext():
-            # A KVCacheTensor lists several layers; sharing one page buffer among them
-            # would let each layer's KV write clobber the others'.
-            num_blocks = kv_cache_config.num_blocks
-            for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-                for layer_name in kv_cache_tensor.layers:
-                    spec = spec_by_layer[layer_name]
-                    # The layout belongs to the backend; a layer without an impl (fixture
-                    # stubs) gets the token-major default.
-                    impl = getattr(static_ctx.get(layer_name), "impl", None)
-                    impl_cls = (
-                        type(impl) if isinstance(impl, SpyreAttentionImpl) else SpyreAttentionImpl
-                    )
-                    kv_caches[layer_name] = impl_cls.allocate_pages(
-                        num_blocks, spec, self._spyre_device
-                    )
-
-        for layer_name, target in self.shared_kv_cache_layers.items():
-            kv_caches[layer_name] = kv_caches[target]
+            kv_caches = allocate_spyre_kv_caches(
+                kv_cache_config, static_ctx, self.shared_kv_cache_layers, self._spyre_device
+            )
 
         bind_kv_cache(
             kv_caches,  # ty: ignore[invalid-argument-type]
@@ -1956,10 +1870,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     # --- Stubs copied from CPUModelRunner ---
     # These are trivial overrides that GPUModelRunner expects.
-
-    def _init_device_properties(self) -> None:
-        # No CUDA/GPU device properties to query for Spyre
-        pass
 
     def _sync_device(self) -> None:
         # Wait for outstanding async H2D from SpyreCpuGpuBuffer.copy_to_gpu
